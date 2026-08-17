@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""mcp-features-test.py - end-to-end test for the 4 MCP tools"""
+import asyncio, json, os, re, sys
+from pathlib import Path
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+WRAPPER = PLUGIN_ROOT / "bin" / "codebuddy-mcp-server.py"
+
+
+def parse_pid_and_dur(text: str) -> tuple:
+    m = re.search(r"pid=(\d+)", text); pid = int(m.group(1)) if m else None
+    m = re.search(r"model=([^,]+)", text); model = m.group(1).strip() if m else None
+    m = re.search(r"dur=([\d.]+)s", text); dur = float(m.group(1)) if m else None
+    return pid, model, dur
+
+
+async def main() -> int:
+    if not WRAPPER.exists():
+        print(f"FAIL: wrapper not found: {WRAPPER}"); return 1
+    server_params = StdioServerParameters(
+        command=sys.executable, args=[str(WRAPPER)],
+        env={**os.environ, "CODEBUDDY_MCP_CWD": str(PLUGIN_ROOT),
+             "MCODE_BASE_PROMPT_FILE": str(PLUGIN_ROOT / "assets" / "mcode-base-system-prompt.md")},
+    )
+    failures: list[str] = []
+    pids: list[int] = []
+    print("→ spawning codebuddy-mcp-server via stdio...")
+    async with stdio_client(server_params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            tools = await session.list_tools()
+            names = sorted(t.name for t in tools.tools)
+            assert names == sorted(["prompt", "continue", "status", "list_tasks"]), f"unexpected tools: {names}"
+            print(f"✓ tools/list: {names}")
+            r = await session.call_tool("status", {})
+            st = json.loads(r.content[0].text.split("\n", 1)[1])
+            print(f"  status(before): {st}")
+            assert st["alive"] is True; assert st["call_count"] == 0
+            assert st["acp_session_id"]; assert st["codebuddy_pid"] is not None
+            print(f"✓ status: pid={st['codebuddy_pid']}, acp_session={st['acp_session_id'][:8]}...")
+            for i in range(3):
+                r = await session.call_tool("prompt", {"text": f"用 5 个字说 hi, 第 {i+1} 次"})
+                txt = r.content[0].text; pid, model, dur = parse_pid_and_dur(txt); pids.append(pid)
+                print(f"  call {i+1}: pid={pid}, model={model}, dur={dur}s")
+            assert len(set(pids)) == 1, f"pids should all be the same, got {pids}"
+            print(f"✓ 3 calls share single codebuddy PID {pids[0]}")
+            r = await session.call_tool("continue", {"text": "再用一个字说 bye"})
+            txt = r.content[0].text; pid, _, _ = parse_pid_and_dur(txt)
+            assert pid == pids[0], f"continue should not respawn; pid {pid} != {pids[0]}"
+            print(f"✓ continue reuses same PID {pid} (no respawn)")
+            r = await session.call_tool("status", {})
+            st = json.loads(r.content[0].text.split("\n", 1)[1])
+            assert st["call_count"] == 4; assert st["last_cache_ratio"] is not None
+            assert st["totals"]["prompt_tokens"] > 0
+            print(f"✓ status(after 4 calls): count={st['call_count']}, last_cache={st['last_cache_ratio']}%, totals.pt={st['totals']['prompt_tokens']}")
+            r = await session.call_tool("list_tasks", {"limit": 10})
+            items = json.loads(r.content[0].text.split("\n", 1)[1])
+            assert len(items) == 4
+            for i, item in enumerate(items):
+                assert item["idx"] == 4 - i, f"item {i} idx should be {4 - i}, got {item['idx']}"
+            print(f"✓ list_tasks: {len(items)} records, most recent first, latest idx={items[0]['idx']} model={items[0]['model']}")
+            r = await session.call_tool("prompt", {"text": "用 3 个字说 ok", "model": "hy3"})
+            txt = r.content[0].text; pid_after_model, _, _ = parse_pid_and_dur(txt)
+            assert pid_after_model == pids[0], f"same model should not respawn; got pid {pid_after_model}"
+            print(f"✓ prompt with same model: pid unchanged ({pid_after_model})")
+            r = await session.call_tool("prompt", {"text": "现在回答 short", "append_system_prompt": "Always answer in exactly 3 words."})
+            txt = r.content[0].text; pid_after_append, _, _ = parse_pid_and_dur(txt)
+            assert pid_after_append != pids[0], f"append change should respawn; pid {pid_after_append} == {pids[0]} (no respawn)"
+            pids.append(pid_after_append)
+            print(f"✓ append_system_prompt triggered respawn: pid {pids[0]} → {pid_after_append}")
+            r = await session.call_tool("status", {})
+            st = json.loads(r.content[0].text.split("\n", 1)[1])
+            assert st["call_count"] == 6; assert st["codebuddy_pid"] == pid_after_append
+            print(f"✓ status: call_count={st['call_count']}, pid={st['codebuddy_pid']} matches post-respawn")
+            r = await session.call_tool("list_tasks", {"limit": 2})
+            items = json.loads(r.content[0].text.split("\n", 1)[1])
+            assert len(items) == 2
+            print(f"✓ list_tasks(limit=2): returned {len(items)} items")
+    if failures:
+        print(f"\n✗ {len(failures)} FAILED:")
+        for f in failures: print(f"  - {f}")
+        return 1
+    print("\n✓ ALL FEATURES PASSED: status / list_tasks / continue / model / append / cache")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(asyncio.run(main()))

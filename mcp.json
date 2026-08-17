@@ -1,0 +1,12 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "codebuddy": {
+      "type": "stdio",
+      "command": "./bin/codebuddy-mcp-server.py",
+      "env": {
+        "MCODE_BASE_PROMPT_FILE": "${PLUGIN_ROOT}/assets/mcode-base-system-prompt.md"
+      }
+    }
+  }
+}

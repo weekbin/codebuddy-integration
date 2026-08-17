@@ -1,8 +1,8 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "codebuddy-integration",
-  "version": "0.2.1",
-  "description": "给 mcode 增加一个调用 codebuddy 的入口,处理翻译、长文摘要、寻求不同意见、换思路重写代码这类纯文字任务。",
+  "version": "0.3.0",
+  "description": "给 mcode 增加一个调用 codebuddy 的入口,处理翻译、长文摘要、寻求不同意见、换思路重写代码这类纯文字任务。Phase 0+ 通过 stdio MCP 提供长驻 wrapper (prompt/continue/status/list_tasks 4 个 tool),与 Agent Plugins 1.0.0 规范对齐, 由 mcode 启动时通过 mcp.json 自动 spawn。",
   "author": {
     "name": "weekbin",
     "url": "https://github.com/weekbin"
@@ -15,6 +15,8 @@
     "subagent",
     "second-opinion",
     "translation",
-    "summarization"
+    "summarization",
+    "mcp",
+    "agent-plugins-spec-1.0.0"
   ]
 }
