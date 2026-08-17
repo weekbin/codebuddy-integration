@@ -101,6 +101,7 @@ class ACPSession:
         self._notif_lock = threading.Lock()
         self.session_id: Optional[str] = None
         self.last_model: Optional[str] = None
+        self.available_models: list = []  # populated by _session_new from server's models.availableModels
         self._appended_text: Optional[str] = None
         self.started_at = time.time()
         self.call_count = 0
@@ -230,40 +231,106 @@ class ACPSession:
     def _initialize(self):
         self.call("initialize", {
             "protocolVersion": 1,
-            "clientInfo": {"name": "codebuddy-mcp-server", "version": "0.3.2"},
+            "clientInfo": {"name": "codebuddy-mcp-server", "version": "0.3.3"},
             "capabilities": {},
         }, timeout=15)
 
     def _session_new(self):
-        # Model is no longer accepted here. It's set at subprocess spawn time
-        # (via `codebuddy --model X`); passing params.model in this JSON-RPC
-        # call is silently ignored by the server. Keeping the signature
-        # keyword-free so call sites can't accidentally regress to the broken
-        # path.
+        # Model is no longer accepted here. The CLI's --model X sets the
+        # initial model; runtime switches go through session/set_config_option
+        # (see _set_config_option). Passing params.model in this JSON-RPC call
+        # is silently ignored by the server.
         params = {"cwd": self.cwd, "mcpServers": []}
         r = self.call("session/new", params, timeout=30)
         self.session_id = r.get("sessionId")
         if not self.session_id:
             raise RuntimeError(f"session/new returned no sessionId: {r}")
+        # Capture the rich model catalog the server returns here (it includes
+        # credits, maxInputTokens, supportsReasoning, etc. — much richer than
+        # what `codebuddy --help` exposes). `list_models` reads this instead
+        # of re-parsing the CLI help text. We accept both the dict form
+        # `{"availableModels": [...]}` and the bare-list form for forward compat.
+        models = r.get("models")
+        if isinstance(models, dict) and "availableModels" in models:
+            self.available_models = list(models["availableModels"])
+        elif isinstance(models, list):
+            self.available_models = models
+        else:
+            self.available_models = []
+        # Initial model is whatever the CLI was spawned with; if no --model
+        # was passed, this stays None and the server default (currently hy3)
+        # is in effect. Don't assume here — let the first session_info_update
+        # populate self.last_model.
         return r
 
-    def prompt(self, text, model=None, append_system_prompt=None, timeout=None) -> dict:
+    def _set_config_option(self, config_id: str, value, timeout: int = 15) -> dict:
+        """Set a session-level config option at runtime. Verified methods
+        on the codebuddy --acp server (2026-08-18):
+        - `session/set_config_option` with `{sessionId, configId, value}`
+          is the ACP-standard way; response is the full configOptions list
+          with updated currentValue.
+        - `session/set_model` with `{sessionId, modelId}` is a non-standard
+          shortcut that the server also accepts.
+        We use the standard one; falls back to respawn if the server rejects
+        it (older server build).
+        """
+        r = self.call("session/set_config_option", {
+            "sessionId": self.session_id,
+            "configId": config_id,
+            "value": value,
+        }, timeout=timeout)
+        # The response is a list of config options; find the one we just
+        # set and confirm the server applied it. If the value didn't change
+        # the caller (prompt()) raises to trigger the respawn fallback.
+        for opt in (r.get("configOptions") or []):
+            if opt.get("id") == config_id:
+                return opt
+        return r
+
+    def _switch_model(self, new_model: str) -> None:
+        """Switch the active model at runtime. Tries the ACP-standard
+        `session/set_config_option` first (fast, preserves session_id,
+        cache, and turn history); falls back to subprocess respawn only
+        if the server rejects the config option (older codebuddy builds).
+
+        Verified 2026-08-18 against the live server: set_config_option
+        with configId="model" changes currentValue and the next prompt
+        uses the new model — no respawn, no session_id change, no cache
+        cold-start.
+        """
+        try:
+            opt = self._set_config_option("model", new_model)
+        except Exception as e:
+            # Fallback: respawn the subprocess with --model X. The old
+            # (0.3.2) path. Costs ~1-2s and a cold cache, but works on
+            # any server build.
+            _log_line("model_switch_fallback_respawn", err=str(e), model=new_model)
+            self._respawn(model=new_model)
+            self.last_model = new_model
+            return
+        # Server accepted the config option. Confirm it actually applied
+        # (defense against servers that return 200 but ignore the write).
+        applied = opt.get("currentValue") if isinstance(opt, dict) else None
+        if applied != new_model:
+            # Server lied or rejected silently. Fall back to respawn so
+            # the caller's intent is honored.
+            _log_line("model_switch_mismatch", sent=new_model, currentValue=applied)
+            self._respawn(model=new_model)
+        self.last_model = new_model
+
+    def prompt(self, text, model=None, append_system_prompt=None,
+               include_thinking=False, timeout=None) -> dict:
         timeout = timeout or self.timeout
         if append_system_prompt and append_system_prompt != self._appended_text:
             self._respawn(append_text=append_system_prompt)
             self._appended_text = append_system_prompt
-        if model and self.last_model and model != self.last_model:
-            # Model change requires respawning the codebuddy subprocess with
-            # --model X on the CLI; passing params.model in session/new JSON-RPC
-            # is silently ignored by the server (verified 2026-08-18).
-            self._respawn(model=model)
-            self.last_model = model
-        elif model and not self.last_model:
-            # First-time model selection: respawn with --model so the existing
-            # subprocess (which started with the server default) actually uses
-            # the caller-chosen model.
-            self._respawn(model=model)
-            self.last_model = model
+        if model and (not self.last_model or model != self.last_model):
+            # Model change: try the cheap ACP path first. If the server
+            # is on an old build that doesn't support set_config_option,
+            # _switch_model falls back to a subprocess respawn (the
+            # 0.3.2 path). Both paths preserve the caller's intent;
+            # neither needs the caller to know which happened.
+            self._switch_model(model)
         t0 = time.time()
         try:
             r = self.call("session/prompt", {
@@ -282,6 +349,8 @@ class ACPSession:
             }, timeout=timeout)
         duration = time.time() - t0
         message = r.get("text") or r.get("message") or "" if isinstance(r, dict) else ""
+        thinking = ""
+        tool_calls: list[dict] = []  # internal tool execution (Write/Read/Bash/…)
         usage = None
         used_model = None
         for n in self._drain_notifications():
@@ -297,6 +366,32 @@ class ACPSession:
             # "all-in-first-chunk" case.
             if kind == "agent_message_chunk":
                 message += upd.get("content", {}).get("text", "")
+            # Reasoning / "thinking" trace. Opt-in via include_thinking=True;
+            # default is off because this can be hundreds of chunks per call
+            # and bloats the response. We always capture to `thinking` (cheap,
+            # just a string concat) and only include it in the result when
+            # the caller asked.
+            elif kind == "agent_thought_chunk":
+                thinking += upd.get("content", {}).get("text", "")
+            # Tool execution: codebuddy is itself a coding agent — it can
+            # call Read/Write/Bash/etc. internally before answering. Capture
+            # the title + status of each so callers can show "I wrote X
+            # files" without seeing the raw I/O. Always included in result
+            # (small, structured, high-signal for "what did the agent do").
+            elif kind == "tool_call":
+                tool_calls.append({
+                    "id": upd.get("toolCallId"),
+                    "title": upd.get("title"),
+                    "kind": upd.get("kind"),
+                    "status": upd.get("status"),
+                })
+            elif kind == "tool_call_update":
+                tc_id = upd.get("toolCallId")
+                for tc in tool_calls:
+                    if tc.get("id") == tc_id:
+                        new_status = upd.get("status")
+                        if new_status: tc["status"] = new_status
+                        break
             elif kind == "usage_update":
                 u = upd.get("_meta", {}).get("usage")
                 if u: usage = u
@@ -323,7 +418,13 @@ class ACPSession:
             "stop_reason": r.get("stopReason") if isinstance(r, dict) else None,
             "cb_pid": self.pid,
             "cache_ratio": cache_pct,
+            "tool_calls": tool_calls,
         }
+        # Thinking is opt-in: a 79s long task can produce 600+ thought
+        # chunks; always capturing (cheap) but only surfacing when asked.
+        if include_thinking and thinking:
+            result["thinking"] = thinking
+            result["thinking_chars"] = len(thinking)
         self.call_count += 1
         self.last_call_at = t0
         self.last_cache_ratio = cache_pct
@@ -386,20 +487,42 @@ _models_cache_lock = threading.Lock()
 
 
 def list_codebuddy_models() -> dict:
-    """Return codebuddy's supported model IDs.
+    """Return codebuddy's supported model catalog.
 
-    Strategy: parse `codebuddy --help` once and cache for the process
-    lifetime. The CLI documents its `--model` flag with a parenthesized,
-    comma-separated list (e.g. `(hy3, glm-5.2, deepseek-v4-flash, ...)`)
-    on a single line, so a regex is enough. If the binary is upgraded
-    mid-session the wrapper would need to restart to pick up the new
-    list — acceptable trade-off, since restarting the wrapper is cheap
-    and model lists change with codebuddy version bumps anyway.
+    Strategy: the wrapper's `ACPSession._session_new` already captures
+    `models.availableModels` from the `session/new` JSON-RPC response,
+    which is a rich list with id, name, description, supportsImages,
+    supportsReasoning, credits, maxInputTokens — much richer than
+    what `codebuddy --help` exposes. The MCP-level list_models tool
+    reads from the active session if one exists; if not, it falls back
+    to a fresh subprocess + `codebuddy --help` parse. This function
+    is the module-level entry point (used by both the tool handler and
+    the test suite) and is safe to call before any session is created.
     """
     global _models_cache
     with _models_cache_lock:
         if _models_cache is not None:
             return _models_cache
+        # If a session is already live, its catalog is fresher than a
+        # codebuddy --help parse (the server can return models the CLI
+        # help text doesn't list, e.g. custom-local:* names from a
+        # user config). Copy it out under the lock.
+        if _session is not None:
+            try:
+                rich = list(_session.available_models or [])
+            except Exception:
+                rich = []
+            if rich:
+                ids = [m.get("modelId") for m in rich if m.get("modelId")]
+                _models_cache = {
+                    "ok": True, "models": ids, "count": len(ids),
+                    "rich": rich,  # full metadata for callers that want it
+                    "source": "session/new models.availableModels",
+                }
+                return _models_cache
+        # Fallback: parse codebuddy --help. The CLI documents its `--model`
+        # flag with a parenthesized, comma-separated list of ids on a
+        # single line, so a regex is enough.
         cb_bin = os.environ.get("CODEBUDDY_BIN") or "codebuddy"
         try:
             r = subprocess.run(
@@ -419,10 +542,6 @@ def list_codebuddy_models() -> dict:
             }
             return _models_cache
         out = (r.stdout or "") + "\n" + (r.stderr or "")
-        # Find the line that documents --model, then extract the parenthesized list.
-        # Tolerate help-text reformatting (commander sometimes wraps or reorders
-        # fields) by scanning all lines for one that contains both "--model" and
-        # a parenthesized comma-separated list.
         models_line = None
         for line in out.splitlines():
             if "--model" not in line:
@@ -452,9 +571,11 @@ def _prompt_props() -> dict:
     return {
         "text": {"type": "string", "description": "The prompt / task description to send to codebuddy."},
         "model": {"type": "string",
-                  "description": "Optional codebuddy model id (e.g. 'hy3', 'deepseek-v4-flash'). Use `list_models` to enumerate valid ids. Changing the model respawns the codebuddy subprocess (~1-2s + cache reset)."},
+                  "description": "Optional codebuddy model id (e.g. 'hy3', 'deepseek-v4-flash'). Use `list_models` to enumerate valid ids. Switching models is dynamic via `session/set_config_option` (preserves session_id, cache, and turn history) — no subprocess restart in the normal path."},
         "append_system_prompt": {"type": "string",
                                  "description": "Optional business rules / context appended to the mcode base system prompt. First call applies; subsequent changes trigger a subprocess respawn so the new append takes effect."},
+        "include_thinking": {"type": "boolean",
+                             "description": "If true, include the model's reasoning trace (`agent_thought_chunk` stream) in the response. Off by default — a long task can produce hundreds of thought chunks. Default false."},
         "timeout": {"type": "integer", "description": "Per-call timeout in seconds (default 300)."},
     }
 
@@ -493,7 +614,22 @@ async def _list_tools(ctx, params):
 
 
 def _format_result(result: dict) -> str:
-    body = result.get("text", "")
+    parts: list[str] = [result.get("text", "")]
+    # Opt-in thinking trace (request include_thinking=true on the prompt
+    # tool). Format with a clear header so callers can grep for it.
+    thinking = result.get("thinking")
+    if thinking:
+        parts.append(f"--- thinking ({result.get('thinking_chars', len(thinking))} chars) ---\n{thinking}")
+    # Tool calls are always included (small, structured, high-signal).
+    # Each line: "tool title [status]" — enough for "what did the agent do".
+    tool_calls = result.get("tool_calls") or []
+    if tool_calls:
+        lines = [f"--- tools ({len(tool_calls)}) ---"]
+        for tc in tool_calls:
+            title = tc.get("title") or tc.get("kind") or "?"
+            status = tc.get("status") or "?"
+            lines.append(f"  {title} [{status}]")
+        parts.append("\n".join(lines))
     meta = [f"[codebuddy: pid={result.get('cb_pid') or '?'}, model={result.get('model') or '?'}, dur={result.get('duration_s')}s, stop={result.get('stop_reason') or '?'}]"]
     usage = result.get("usage") or {}
     if usage:
@@ -501,7 +637,8 @@ def _format_result(result: dict) -> str:
         ct = usage.get("completion_tokens", 0)
         cached = usage.get("prompt_tokens_details", {}).get("cached_tokens", 0)
         meta.append(f"[tokens: prompt={pt}, completion={ct}, cache_read={cached}, cache_ratio={result.get('cache_ratio', 0)}%]")
-    return body + "\n\n" + "\n".join(meta)
+    parts.append("\n".join(meta))
+    return "\n\n".join(parts)
 
 
 async def _call_tool(ctx, params):
@@ -515,6 +652,7 @@ async def _call_tool(ctx, params):
         result = sess.prompt(
             text=text, model=arguments.get("model"),
             append_system_prompt=arguments.get("append_system_prompt"),
+            include_thinking=bool(arguments.get("include_thinking", False)),
             timeout=arguments.get("timeout"),
         )
         return CallToolResult(content=[TextContent(type="text", text=_format_result(result))])

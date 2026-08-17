@@ -4,6 +4,68 @@ All notable changes to this plugin are documented in this file. The format is ba
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] - 2026-08-18
+
+### Fixed
+
+- **Model switching was respawning the subprocess when it didn't need to.**
+  0.3.2 fixed `--model` getting to argv at spawn time but kept respawn as
+  the only way to switch model mid-session — paying ~1-2s + a cold cache
+  every time. The codebuddy ACP server actually supports runtime
+  `session/set_config_option` with `{configId: "model", value: "..."}`
+  (verified 2026-08-18 by capturing full JSON-RPC traffic with
+  `CODEBUDDY_MCP_DEBUG_LOG` and probing candidate RPCs). The new
+  `_switch_model` tries set_config_option first (preserves session_id,
+  cache, turn history) and only falls back to respawn if the server
+  rejects the option (older codebuddy build) or lies (returns 200 but
+  `currentValue` didn't change).
+- **Output stage info was being thrown away**: 620+ `agent_thought_chunk`
+  events (the model's reasoning trace) per long task were silently
+  dropped; same for `tool_call` / `tool_call_update` events that record
+  the agent's internal Read/Write/Bash calls. The new code captures
+  both — thinking is opt-in via `include_thinking=true` on the prompt
+  (default off, since 600+ thought chunks per task is noisy), and
+  tool calls are always summarized in a compact `--- tools (N) ---`
+  block at the end of the response.
+
+### Changed
+
+- **`list_models` now reads from the live `session/new` response** instead
+  of re-parsing `codebuddy --help`. The server returns a richer
+  `models.availableModels` list with each model's `name`, `description`
+  (credits cost), `_meta.supportsImages`, `_meta.supportsReasoning`,
+  `_meta.maxInputTokens`. The full rich list is included in the
+  `list_models` response under a `rich` key. Fallback to `--help`
+  parse is kept for cases where no session is live yet.
+
+### Tests
+
+- `tests/test_mcp_wrapper_unit.py` 26 → 34 tests. Added `TestSetConfigOption`
+  (asserts the right RPC + params), `TestSwitchModel` (3 cases: happy
+  path uses set_config_option, server-error falls back to respawn,
+  server-lies falls back to respawn), `TestThinkingAndToolCalls`
+  (4 cases: include_thinking gates the thinking field, default
+  suppresses it, tool_call + tool_call_update merge correctly into
+  a single entry, formatter renders both sections).
+- `tests/mcp-features-test.py` model-switch assertion **inverted**:
+  0.3.2 expected respawn; 0.3.3 expects no respawn (the
+  set_config_option path). Also added a switch-back test
+  (hy3 → deepseek-v4-flash → hy3) and two new `include_thinking`
+  cases (true exposes the section, default suppresses it).
+- `tests/mcp-traffic-capture-test.py`: new — uses
+  `CODEBUDDY_MCP_DEBUG_LOG` to dump every JSON-RPC line the wrapper
+  reads from `codebuddy --acp` stdout, then classifies the
+  notification kinds (620 thought chunks, 120 message chunks,
+  127 tool_call_update, 31 session_info_update, etc.). Used to
+  discover the `set_config_option` runtime-switch path and the
+  rich `session/new` model catalog. Worth keeping as a regression
+  detector — if the protocol changes, this surfaces it.
+- `tests/mcp-set-model-probe-test.py`: new — direct stdio JSON-RPC
+  probe of `codebuddy --acp`, sends 5 candidate RPC methods
+  (`session/set_config_option`, `session/set_model`, `session/configure`,
+  `session/set`, `session/select_model`) and reports which the
+  server actually accepts.
+
 ## [0.3.2] - 2026-08-18
 
 ### Fixed

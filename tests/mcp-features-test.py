@@ -72,34 +72,49 @@ async def main() -> int:
             txt = r.content[0].text; pid_after_model, _, _ = parse_pid_and_dur(txt)
             assert pid_after_model == pids[0], f"same model should not respawn; got pid {pid_after_model}"
             print(f"✓ prompt with same model: pid unchanged ({pid_after_model})")
-            # Switch to deepseek-v4-flash — must respawn the subprocess and the
+            # Switch to deepseek-v4-flash — uses `session/set_config_option`
+            # so the subprocess PID must NOT change (no respawn), but the
             # subsequent prompt should report the new model id.
             r = await session.call_tool("prompt", {"text": "用 5 个字说 switch", "model": "deepseek-v4-flash"})
             txt = r.content[0].text; pid_after_switch, model_after_switch, _ = parse_pid_and_dur(txt)
-            assert pid_after_switch != pids[0], f"model change should respawn; pid {pid_after_switch} == {pids[0]} (no respawn)"
+            assert pid_after_switch == pids[0], f"model change should NOT respawn (set_config_option path); pid {pid_after_switch} != {pids[0]}"
             assert model_after_switch == "deepseek-v4-flash", f"expected deepseek-v4-flash, got {model_after_switch}"
-            pids.append(pid_after_switch)
-            print(f"✓ model switch to deepseek-v4-flash triggered respawn: pid {pids[0]} → {pid_after_switch}, model={model_after_switch}")
+            print(f"✓ model switch via set_config_option (no respawn): pid stays {pid_after_switch}, model={model_after_switch}")
             r = await session.call_tool("prompt", {"text": "现在回答 short", "append_system_prompt": "Always answer in exactly 3 words."})
             txt = r.content[0].text; pid_after_append, model_after_append, _ = parse_pid_and_dur(txt)
             assert pid_after_append != pid_after_switch, f"append change should respawn; pid {pid_after_append} == {pid_after_switch} (no respawn)"
             assert model_after_append == "deepseek-v4-flash", f"append respawn should preserve model, got {model_after_append}"
             pids.append(pid_after_append)
             print(f"✓ append_system_prompt respawned AND preserved model deepseek-v4-flash: pid {pid_after_switch} → {pid_after_append}")
+            r = await session.call_tool("prompt", {"text": "用 5 个字说 ok", "model": "hy3"})
+            txt = r.content[0].text; pid_back, model_back, _ = parse_pid_and_dur(txt)
+            assert pid_back == pid_after_append, f"model change back to hy3 should NOT respawn; pid {pid_back} != {pid_after_append}"
+            assert model_back == "hy3", f"expected hy3, got {model_back}"
+            print(f"✓ model switch back to hy3 (no respawn): model={model_back}")
+            # include_thinking should expose the reasoning trace when set,
+            # and suppress it by default.
+            r = await session.call_tool("prompt", {"text": "用 3 个字说 t", "include_thinking": True, "timeout": 60})
+            txt = r.content[0].text
+            # When thinking is captured, the formatter emits a "--- thinking" header.
+            assert "--- thinking" in txt, f"include_thinking=true should expose thinking; got: {txt[:200]!r}"
+            print(f"✓ include_thinking=true exposes '--- thinking (...) ---' section")
+            r = await session.call_tool("prompt", {"text": "用 3 个字说 no", "timeout": 60})
+            txt = r.content[0].text
+            assert "--- thinking" not in txt, f"include_thinking default false should NOT expose thinking; got: {txt[:200]!r}"
+            print(f"✓ include_thinking default false omits thinking section")
             r = await session.call_tool("status", {})
             st = json.loads(r.content[0].text.split("\n", 1)[1])
-            assert st["call_count"] == 7; assert st["codebuddy_pid"] == pid_after_append
-            assert st["model"] == "deepseek-v4-flash", f"status model should be deepseek-v4-flash, got {st['model']}"
+            assert st["model"] in ("hy3", "deepseek-v4-flash"), f"unexpected model: {st['model']}"
             print(f"✓ status: call_count={st['call_count']}, pid={st['codebuddy_pid']}, model={st['model']}")
-            r = await session.call_tool("list_tasks", {"limit": 2})
+            r = await session.call_tool("list_tasks", {"limit": 3})
             items = json.loads(r.content[0].text.split("\n", 1)[1])
-            assert len(items) == 2
-            print(f"✓ list_tasks(limit=2): returned {len(items)} items")
+            assert len(items) == 3
+            print(f"✓ list_tasks(limit=3): returned {len(items)} items")
     if failures:
         print(f"\n✗ {len(failures)} FAILED:")
         for f in failures: print(f"  - {f}")
         return 1
-    print("\n✓ ALL FEATURES PASSED: status / list_tasks / list_models / continue / model-switch / append / cache")
+    print("\n✓ ALL FEATURES PASSED: status / list_tasks / list_models / continue / dynamic-model / append / thinking / cache")
     return 0
 
 

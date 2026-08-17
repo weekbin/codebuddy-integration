@@ -309,6 +309,191 @@ class TestChunkConcatenation(unittest.TestCase):
         self.assertEqual(r["text"], "short")
 
 
+class TestSetConfigOption(unittest.TestCase):
+    """`_set_config_option` must call `session/set_config_option` with
+    `{sessionId, configId, value}` and return the matching configOption
+    from the response. We assert on the call args, not the result."""
+
+    def test_sends_correct_rpc(self):
+        import unittest.mock as mock
+        sess = _mod.ACPSession.__new__(_mod.ACPSession)
+        sess.session_id = "sess-xyz"
+        sess.call = mock.MagicMock(return_value={
+            "configOptions": [
+                {"id": "mode", "currentValue": "bypassPermissions"},
+                {"id": "model", "currentValue": "deepseek-v4-flash"},
+                {"id": "thought_level", "currentValue": "enabled"},
+            ]
+        })
+        opt = sess._set_config_option("model", "deepseek-v4-flash")
+        sess.call.assert_called_once()
+        args = sess.call.call_args
+        self.assertEqual(args[0][0], "session/set_config_option")
+        params = args[0][1]
+        self.assertEqual(params["sessionId"], "sess-xyz")
+        self.assertEqual(params["configId"], "model")
+        self.assertEqual(params["value"], "deepseek-v4-flash")
+        # Returns the matching configOption from the response
+        self.assertEqual(opt["id"], "model")
+        self.assertEqual(opt["currentValue"], "deepseek-v4-flash")
+
+
+class TestSwitchModel(unittest.TestCase):
+    """`_switch_model` tries set_config_option first; falls back to respawn
+    if the server rejects or lies about the write."""
+
+    def _build_sess(self, *, set_opt_return=None, set_opt_raises=None):
+        import unittest.mock as mock
+        sess = _mod.ACPSession.__new__(_mod.ACPSession)
+        sess.session_id = "sess-1"
+        sess.last_model = "hy3"
+        sess._appended_text = None
+        sess.pid = 100
+        sess.proc = mock.MagicMock()
+        sess._spawn = mock.MagicMock()
+        sess._reader = mock.MagicMock()  # don't actually start a thread
+        sess._initialize = mock.MagicMock()
+        sess._session_new = mock.MagicMock()
+        if set_opt_raises:
+            sess._set_config_option = mock.MagicMock(side_effect=set_opt_raises)
+        else:
+            sess._set_config_option = mock.MagicMock(return_value=set_opt_return or {"id": "model", "currentValue": "deepseek-v4-flash"})
+        return sess
+
+    def test_happy_path_uses_set_config_option(self):
+        sess = self._build_sess(set_opt_return={"id": "model", "currentValue": "deepseek-v4-flash"})
+        sess._switch_model("deepseek-v4-flash")
+        sess._set_config_option.assert_called_once_with("model", "deepseek-v4-flash")
+        sess._spawn.assert_not_called()  # respawn NOT used
+        self.assertEqual(sess.last_model, "deepseek-v4-flash")
+
+    def test_falls_back_to_respawn_on_server_error(self):
+        sess = self._build_sess(set_opt_raises=RuntimeError("ACP error: method not found"))
+        sess._switch_model("deepseek-v4-flash")
+        sess._set_config_option.assert_called_once()
+        sess._spawn.assert_called_once()  # respawn IS used
+        # _respawn's call should pass model=...
+        kwargs = sess._spawn.call_args.kwargs
+        self.assertEqual(kwargs.get("model"), "deepseek-v4-flash")
+        self.assertEqual(sess.last_model, "deepseek-v4-flash")
+
+    def test_falls_back_when_server_lies(self):
+        # Server returns 200 but currentValue didn't change — the respawn
+        # fallback is the safety net so the caller's intent is honored.
+        sess = self._build_sess(set_opt_return={"id": "model", "currentValue": "hy3"})
+        sess._switch_model("deepseek-v4-flash")
+        sess._set_config_option.assert_called_once()
+        sess._spawn.assert_called_once()
+
+
+class TestThinkingAndToolCalls(unittest.TestCase):
+    """Verify agent_thought_chunk and tool_call/tool_call_update events
+    are captured, and include_thinking gates whether thinking is in result."""
+
+    def _build_session_with_mixed_events(self, events):
+        import unittest.mock as mock
+        sess = _mod.ACPSession.__new__(_mod.ACPSession)
+        sess.codebuddy_bin = "codebuddy"
+        sess.cwd = "/tmp"
+        sess.mcode_base_prompt_file = None
+        sess.timeout = 30
+        sess._appended_text = None
+        sess.last_model = "hy3"
+        sess.session_id = "sess-1"
+        sess.started_at = time.time()
+        sess.call_count = 0
+        sess.last_call_at = None
+        sess.last_cache_ratio = None
+        sess.totals = {"prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0}
+        sess._tasks = deque(maxlen=50)
+        sess.proc = mock.MagicMock()
+        sess.pid = 99999
+        sess.call = mock.MagicMock(return_value={})
+        sess._drain_notifications = mock.MagicMock(return_value=events)
+        return sess
+
+    def test_thinking_captured_when_include_thinking_true(self):
+        events = [
+            {"params": {"update": {"sessionUpdate": "agent_thought_chunk",
+                                   "content": {"text": "Let me "}}}},
+            {"params": {"update": {"sessionUpdate": "agent_thought_chunk",
+                                   "content": {"text": "think about this..."}}}},
+            {"params": {"update": {"sessionUpdate": "agent_message_chunk",
+                                   "content": {"text": "Answer: 42"}}}},
+            {"params": {"update": {"sessionUpdate": "usage_update",
+                                   "_meta": {"usage": {"prompt_tokens": 100, "completion_tokens": 12,
+                                                       "prompt_tokens_details": {"cached_tokens": 50}}}}}},
+        ]
+        sess = self._build_session_with_mixed_events(events)
+        r = sess.prompt(text="hi", include_thinking=True)
+        self.assertEqual(r["text"], "Answer: 42")
+        self.assertEqual(r["thinking"], "Let me think about this...")
+        self.assertEqual(r["thinking_chars"], len("Let me think about this..."))
+
+    def test_thinking_NOT_in_result_when_include_thinking_false(self):
+        events = [
+            {"params": {"update": {"sessionUpdate": "agent_thought_chunk",
+                                   "content": {"text": "should not be exposed"}}}},
+            {"params": {"update": {"sessionUpdate": "agent_message_chunk",
+                                   "content": {"text": "Answer"}}}},
+        ]
+        sess = self._build_session_with_mixed_events(events)
+        r = sess.prompt(text="hi", include_thinking=False)
+        self.assertEqual(r["text"], "Answer")
+        self.assertNotIn("thinking", r)
+        # And the default (no kwarg) is the same as False
+        sess2 = self._build_session_with_mixed_events(events)
+        r2 = sess2.prompt(text="hi")
+        self.assertNotIn("thinking", r2)
+
+    def test_tool_calls_captured_with_status_updates(self):
+        events = [
+            {"params": {"update": {"sessionUpdate": "tool_call",
+                                   "toolCallId": "t1", "title": "Read", "kind": "other",
+                                   "status": "in_progress"}}},
+            {"params": {"update": {"sessionUpdate": "tool_call",
+                                   "toolCallId": "t2", "title": "Write", "kind": "other",
+                                   "status": "in_progress"}}},
+            {"params": {"update": {"sessionUpdate": "tool_call_update",
+                                   "toolCallId": "t1", "status": "completed"}}},
+            {"params": {"update": {"sessionUpdate": "tool_call_update",
+                                   "toolCallId": "t2", "status": "completed"}}},
+            {"params": {"update": {"sessionUpdate": "agent_message_chunk",
+                                   "content": {"text": "Done."}}}},
+        ]
+        sess = self._build_session_with_mixed_events(events)
+        r = sess.prompt(text="hi")
+        self.assertEqual(len(r["tool_calls"]), 2)
+        # Status updates merged onto the original tool_call entries
+        by_id = {tc["id"]: tc for tc in r["tool_calls"]}
+        self.assertEqual(by_id["t1"]["status"], "completed")
+        self.assertEqual(by_id["t2"]["status"], "completed")
+        self.assertEqual(by_id["t1"]["title"], "Read")
+        self.assertEqual(by_id["t2"]["title"], "Write")
+
+    def test_format_result_renders_thinking_and_tools(self):
+        result = {
+            "text": "Answer: 42",
+            "model": "hy3", "duration_s": 1.2, "stop_reason": "end_turn",
+            "cb_pid": 100, "cache_ratio": 50.0,
+            "usage": {"prompt_tokens": 100, "completion_tokens": 12,
+                      "prompt_tokens_details": {"cached_tokens": 50}},
+            "thinking": "Let me think...",
+            "thinking_chars": 17,
+            "tool_calls": [
+                {"id": "t1", "title": "Read", "status": "completed"},
+                {"id": "t2", "title": "Write", "status": "completed"},
+            ],
+        }
+        out = _mod._format_result(result)
+        self.assertIn("Answer: 42", out)
+        self.assertIn("--- thinking (17 chars) ---", out)
+        self.assertIn("Let me think...", out)
+        self.assertIn("--- tools (2) ---", out)
+        self.assertIn("Read [completed]", out)
+        self.assertIn("Write [completed]", out)
+
+
 def asyncio_run(coro):
     import asyncio
     return asyncio.new_event_loop().run_until_complete(coro)
