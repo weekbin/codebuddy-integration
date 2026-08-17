@@ -10,9 +10,10 @@
 #   6. 返回结果
 #
 # 用法:
-#   invoke-codebuddy "翻译成英文: 你好世界"
-#   invoke-codebuddy --json "用 Python 写一个二分查找"
-#   invoke-codebuddy --keep "写一份完整 README"            # 保留 terminal，可后续追问
+#   invoke-codebuddy --mode print "翻译成英文: 你好世界"   # 纯文本 (推荐 first try, 不需 orca-ide)
+#   invoke-codebuddy "翻译成英文: 你好世界"                 # 默认 acp 模式, 需要 codebuddy 在 PATH
+#   invoke-codebuddy --json "用 Python 写一个二分查找"     # 结构化 JSON 输出
+#   invoke-codebuddy --keep "写一份完整 README"             # 保留 terminal，可后续追问
 #   invoke-codebuddy --follow "继续追问"                    # 复用 --keep 的 terminal
 #   invoke-codebuddy --background "跑长任务"                # 异步，返回 handle + result-file
 #   invoke-codebuddy --await <handle>                      # 阻塞等结果（不烧 mcode token）
@@ -218,15 +219,25 @@ esac
 
 [ -z "$TASK" ] && { usage; exit 2; }
 
-# ── 校验 ORCA / codebuddy (orca-ide 是 optional) ──
-# print + acp 模式完全不依赖 orca-ide, 直接走子进程路径
+# ── 校验 ORCA / codebuddy (orca-ide 是 optional, codebuddy 必须) ──
+# print + acp + acp-bg 三种模式完全不依赖 orca-ide, 直接走子进程路径
 # TUI 模式依赖 orca-ide 开 worktree terminal; 探测不到 orca-ide 时自动 fall back 到 print 模式 + warn
 if [ "$MODE" = "tui" ] && [ -z "$ORCA" ]; then
   echo "invoke-codebuddy: 'orca-ide' not in PATH; TUI unavailable, falling back to --mode print" >&2
+  echo "  (install orca-ide only if you actually need --mode tui / worktree-shared codebuddy)" >&2
   MODE=print
 fi
-# codebuddy binary 在 print + acp + tui 三种模式都必需
-command -v "$CB_BIN" >/dev/null 2>&1 || { echo "invoke-codebuddy: '$CB_BIN' not in PATH" >&2; exit 4; }
+# codebuddy binary 在 print + acp + tui 三种模式都必需. 找不到时给具体修复路径.
+if ! command -v "$CB_BIN" >/dev/null 2>&1; then
+  echo "invoke-codebuddy: codebuddy CLI not found (looked for: '$CB_BIN')." >&2
+  echo "  Fix one of:" >&2
+  echo "    1. export CODEBUDDY_BIN=/abs/path/to/codebuddy          # point at existing install" >&2
+  echo "    2. ln -s /abs/path/to/codebuddy \"\$HOME/bin/codebuddy\" # expose on PATH" >&2
+  echo "    3. npm i -g @tencent-ai/codebuddy-code                  # fresh install" >&2
+  echo "  Find an existing install: find ~/.nvm ~/.local -name codebuddy -type l 2>/dev/null" >&2
+  echo "  Note: ~/.codebuddy/bin/ is the CodeBuddy CN.app (GUI) dir, NOT the CLI." >&2
+  exit 4
+fi
 
 # ── print 模式: 简单 subprocess, 干净 JSON 输出 ─────────
 if [ "$MODE" = "print" ]; then

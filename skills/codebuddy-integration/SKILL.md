@@ -2,10 +2,10 @@
 name: codebuddy-integration
 description: "Delegate a text-reasoning subtask to codebuddy (a peer CLI) via the `invoke-codebuddy` command. Use this Skill when the user asks for a second opinion, a longer-context summary, a translation, a fresh implementation draft, brainstorming, or a design review — and burning codebuddy credits is preferable to spending mcode tokens. Do NOT use for file edits, git operations, or shell commands (mcode already has those tools). Triggers on phrases like '用 codebuddy', '让 codebuddy', 'summarize with codebuddy', 'review with codebuddy', 'ask codebuddy'."
 license: MIT
-compatibility: Requires MiniMax Code with Agent Plugins 1.0 support, the `codebuddy` CLI on $PATH, and (for shared worktree context) the `orca-ide` CLI.
+compatibility: Requires MiniMax Code with Agent Plugins 1.0 support, the `codebuddy` CLI on $PATH (or `CODEBUDDY_BIN` env var pointing at it), and (for `--mode tui` only, otherwise optional) the `orca-ide` CLI.
 metadata:
   author: weekbin
-  version: "0.1.7"
+  version: "0.1.8"
 ---
 
 # codebuddy-integration — codebuddy as a subagent
@@ -17,13 +17,16 @@ codebuddy credits, not mcode tokens.**
 ## Quick reference
 
 ```bash
-# oneshot (5-8s print mode, ~17s tui mode): spawn → run → close → return
+# RECOMMENDED FIRST TRY: print mode (no orca-ide needed, no worktree context, ~4s)
+invoke-codebuddy --mode print "translate to English: 你好世界"
+
+# oneshot in default acp mode (needs codebuddy on PATH; ~5-8s; richer state)
 invoke-codebuddy "translate to English: 你好世界"
 
 # structured output
 invoke-codebuddy --json "write a Python LRU cache"
 
-# pure text path (no orca-ide, no worktree context)
+# pure text path (alias of the recommended first try)
 invoke-codebuddy --mode print "summarize: $(cat spec.md)"
 
 # multi-turn with conversation context
@@ -38,16 +41,55 @@ invoke-codebuddy --metrics <handle>              # rich ACP state: phase / token
 invoke-codebuddy --events <handle>               # full event stream (JSONL, all phase + thought + message + usage)
 
 # async (TUI, when codebuddy needs to do real work in the worktree)
+#   - requires `orca-ide` on PATH; without it the script silently falls back
+#     to --mode print and prints a warning to stderr
 invoke-codebuddy --mode tui --background "edit this file"
 ```
 
+### Mode cheat sheet
+
+| Mode | `--background`? | Needs `codebuddy`? | Needs `orca-ide`? | Use when |
+|------|-----------------|--------------------|-------------------|----------|
+| `print` (default for one-shot) | n/a | yes | **no** | first try, pure text, no worktree context |
+| `acp` (default) | n/a | yes | **no** | full ACP state + tokens + events; works without orca |
+| `acp` (default) + `--background` | yes | yes | **no** (uses `systemd-run` on Linux / `setsid` on macOS) | long task, fire-and-forget |
+| `tui` | n/a | yes | **yes** (with auto-fall-back to `print` if missing) | codebuddy needs to read/edit worktree files via orca-ide terminal |
+| `tui` + `--background` | yes | yes | **yes** (with auto-fall-back) | long task in worktree context |
+
 ## Installation
 
-After installing this plugin, expose the script on `$PATH`:
+After installing this plugin, three things must be true:
+
+1. The `invoke-codebuddy` script is on `$PATH` (or called by absolute path).
+2. The `codebuddy` CLI is on `$PATH` (or `CODEBUDDY_BIN` points to it).
+3. The `orca-ide` CLI is on `$PATH` **only if you want `--mode tui`** — otherwise it is optional (the script will warn and fall back to `--mode print`).
 
 ```bash
-ln -s "$(plugin-root)/bin/invoke-codebuddy" "$HOME/bin/invoke-codebuddy"
+# 1) expose the script
+PLUGIN_ROOT="$(plugin-root)"   # e.g. ~/.minimax/plugins/codebuddy-integration
+ln -s "$PLUGIN_ROOT/bin/invoke-codebuddy" "$HOME/bin/invoke-codebuddy"
+
+# 2) expose codebuddy (pick one)
+#    a) if it's already installed, just find it and put it on PATH:
+find ~/.nvm ~/.local /opt -name codebuddy -type l 2>/dev/null | head -3
+export CODEBUDDY_BIN="$(find ~/.nvm ~/.local -name codebuddy -type l 2>/dev/null | head -1)"
+#       (add the export to ~/.zshenv / ~/.bashrc to persist)
+#    b) or symlink it to a dir on PATH:
+ln -sf "$(command -v codebuddy 2>/dev/null || echo /path/to/codebuddy)" "$HOME/bin/codebuddy"
+#    c) or install fresh:
+#       npm i -g @tencent-ai/codebuddy-code
+
+# 3) (only if you need --mode tui) install orca-ide
+#    brew install --cask orca-ide   # macOS
+#    see https://github.com/hetaoBackend/orca for Linux / other
 ```
+
+> **`~/.codebuddy/bin/` is a directory created by the CodeBuddy CN.app macOS
+> bundle — it is NOT where the `codebuddy` CLI lives.** The CLI is an npm
+> package (`@tencent-ai/codebuddy-code`) and lands under your node version
+> manager (`~/.nvm/versions/node/<v>/bin/`, `~/.local/bin/`, etc.). If
+> `command -v codebuddy` is empty but `ls ~/.codebuddy/bin/` shows a
+> `buddycn` symlink, you are looking at the wrong directory.
 
 `$(plugin-root)` is the directory containing this plugin (e.g. `~/.minimax/plugins/weekbin/codebuddy-integration`
 or wherever MiniMax Code unzips the plugin). The script uses `readlink -f "$0"` to resolve its
@@ -565,14 +607,16 @@ Notes on this pattern:
 
 | Symptom | Cause | Recovery |
 |---------|-------|----------|
-| `invoke-codebuddy: 'codebuddy' not in PATH` | codebuddy CLI not installed or PATH broken | `command -v codebuddy`; reinstall from `npm i -g @tencent-ai/codebuddy-code` |
+| `invoke-codebuddy: codebuddy CLI not found (looked for: 'codebuddy')` followed by 3 fix hints | codebuddy CLI not on `$PATH` (and `CODEBUDDY_BIN` not set) | `export CODEBUDDY_BIN=/abs/path/to/codebuddy` (e.g. `~/.nvm/versions/node/v24.12.0/bin/codebuddy`), or symlink it to `~/bin/codebuddy`, or `npm i -g @tencent-ai/codebuddy-code` |
 | `invoke-codebuddy: 'orca-ide' not in PATH; TUI unavailable, falling back to --mode print` | `orca-ide` not installed; TUI mode was requested | **This is a warning, not an error.** The script automatically fell back to `--mode print` and returned a result. Install `orca-ide` and pass `--mode tui` explicitly if you actually need worktree-shared codebuddy. |
+| `(error: subprocess failed)` from print mode | codebuddy subprocess exited non-zero or its JSON output was unparseable | run `codebuddy --print --output-format json --dangerously-skip-permissions --no-session-persistence "your prompt"` directly to see the real error; usually a network/auth issue |
 | `(无可见回复 - 可能是长答案被 TUI 折叠)` | codebuddy's TUI truncated the response | re-run with `--keep` and read full output with `--status`; or use `--mode print` |
 | `--follow` says "I don't have a previous answer" | codebuddy's TUI was reset between turns | check the handle is still alive: `invoke-codebuddy --status $(cat state/handle)`; if not, use `--new-session` |
 | `invoke-codebuddy: need handle (arg or .../state/handle)` | `--status` / `--kill` with no handle and no stored handle | pass the handle explicitly, or use `--keep` / `--follow` first to create one |
 | `orca terminal close` hangs or errors | orca-ide is not running | `orca-ide status --json`; if `runtime.reachable=false`, start with `orca-ide open` |
 | `invoke-codebuddy: failed to create codebuddy terminal` | orca worktree context lost or auth expired | `orca-ide worktree current --json`; re-auth codebuddy if needed |
 | Codebuddy times out (>5 min) | long task or rate limit | re-run with `--background` and poll with `--status`; or split into smaller prompts |
+| `--mode tui` works on Linux but hangs on macOS | macOS has no `systemd-run`; the script's fallback to `setsid` for `--background` is less robust than the systemd path | for macOS, prefer `--mode print` for one-shots, and `--mode tui` (foreground) without `--background` for in-worktree work; long-running macOS background tasks may need a manual `nohup … &` wrapper |
 
 ### Hard rules
 

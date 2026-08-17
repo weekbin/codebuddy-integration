@@ -4,6 +4,46 @@ All notable changes to this plugin are documented in this file. The format is ba
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.8] - 2026-08-17
+
+### Fixed (from cross-machine gap report on 0.1.7 install)
+
+- **`codebuddy` CLI missing is now an actionable error** (was: one-liner
+  `'codebuddy' not in PATH` that left users unable to distinguish from
+  orca-ide / network / timeout failures). In `bin/invoke-codebuddy`:
+  - The upfront `command -v "$CB_BIN"` check now prints a **5-line
+    diagnostic** listing the three common fix paths in priority order:
+    `CODEBUDDY_BIN=/abs/path`, symlink to `~/bin/codebuddy`, or
+    `npm i -g @tencent-ai/codebuddy-code`. It also points at the
+    `find ~/.nvm ~/.local -name codebuddy -type l` lookup so users on
+    a stock nvm install can discover the real path in one command.
+  - The `~/.codebuddy/bin/` directory naming collision with
+    CodeBuddy CN.app (GUI) is now called out in the error, the
+    README Requirements, and the SKILL.md Installation section.
+
+### Documented
+
+- `SKILL.md` Quick reference **leads with `--mode print` as the
+  recommended first try** for fresh installs (4s, no orca-ide, no
+  worktree context). The default acp-mode line is now explicitly
+  second and labeled as needing `codebuddy` on PATH.
+- New `SKILL.md` "Mode cheat sheet" table shows the four
+  (mode × background) combinations and which CLIs each requires.
+- `SKILL.md` Installation section is now a 3-step checklist
+  (script on PATH → codebuddy on PATH → orca-ide if you need TUI)
+  with the `find ~/.nvm ~/.local -name codebuddy -type l` lookup
+  and the CodeBuddy CN.app warning.
+- `SKILL.md` Troubleshooting table adds rows for the new
+  codebuddy-missing error and the macOS systemd gap.
+- `SKILL.md` top-of-file `compatibility` line now mentions
+  `CODEBUDDY_BIN` as an alternative to PATH exposure.
+- `README.md` Requirements section adds the `CODEBUDDY_BIN` alt
+  and the `~/.codebuddy/bin/` warning.
+
+### Changed
+
+- Bumped `plugin.json`, `SKILL.md` metadata to `0.1.8`.
+
 ## [0.1.7] - 2026-08-17
 
 ### Fixed (from live feedback during 0.1.6 install)

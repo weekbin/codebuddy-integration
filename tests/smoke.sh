@@ -115,12 +115,12 @@ if [ -f "$BRIDGE" ]; then
   assert_grep "bridge usage shows example" 'translate to English' "$out"
 
   # 7c) Bridge with a prompt but no codebuddy on PATH -> forwards error from
-  #     invoke-codebuddy (exit code 4 = "codebuddy not in PATH"). Verifies
+  #     invoke-codebuddy (exit code 4 = "codebuddy not found"). Verifies
   #     sibling resolution + error propagation. We strip PATH down so the
   #     bridge cannot accidentally find a real codebuddy in this test.
   out="$(env -i HOME="$TMPHOME" PATH="/usr/bin:/bin" "$BRIDGE" "smoke test prompt" 2>&1)"; rc=$?
   assert_exit "bridge propagates invoke-codebuddy failure" 4 "$rc" "$out"
-  assert_grep "bridge surfaces 'codebuddy' missing" "codebuddy.*not in PATH" "$out"
+  assert_grep "bridge surfaces 'codebuddy' missing" "codebuddy CLI not found" "$out"
 
   # 7d) bash -n on the bridge
   if bash -n "$BRIDGE" >/dev/null 2>&1; then
@@ -233,6 +233,55 @@ assert_grep "ACP without orca-ide returns codebuddy reply" '你好' "$out"
 
 # Cleanup fake bin + BASH_ENV
 rm -rf "$(dirname "$FAKE_BIN")" "$BASH_ENV_FILE"
+
+echo
+echo "===== 0.1.8: friendly codebuddy-missing error ====="
+# When `codebuddy` is genuinely not findable, the script should print a
+# 5-line diagnostic listing CODEBUDDY_BIN / symlink / npm install paths
+# and exit 4. We force this by setting an empty PATH (so command -v fails)
+# plus a BASH_ENV that hides `command -v codebuddy` from the script's
+# own bash process.
+NO_CB_BASH_ENV="$(mktemp -t cb-smoke-no-cb-XXXXXX.sh)"
+cat > "$NO_CB_BASH_ENV" <<'EOF'
+command() {
+  if [ "$1" = "-v" ] && [ "$2" = "codebuddy" ]; then
+    return 1
+  fi
+  builtin command "$@"
+}
+EOF
+# 13) --mode print with no codebuddy in PATH exits 4 with friendly
+#     diagnostic on stderr.
+out="$(env -i HOME="$REAL_HOME" PATH="/usr/bin:/bin" BASH_ENV="$NO_CB_BASH_ENV" \
+  "$SCRIPT" --mode print --no-log '用 5 个字说 hi' 2>/tmp/no_cb_stderr)"
+rc=$?
+NO_CB_STDERR="$(cat /tmp/no_cb_stderr)"
+rm -f /tmp/no_cb_stderr
+assert_exit "no codebuddy exits 4" 4 "$rc" "$out"
+assert_grep "no codebuddy diagnostic mentions CODEBUDDY_BIN" 'CODEBUDDY_BIN' "$NO_CB_STDERR"
+assert_grep "no codebuddy diagnostic mentions npm install" 'npm i -g' "$NO_CB_STDERR"
+assert_grep "no codebuddy diagnostic mentions the .codebuddy/bin confusion" 'CodeBuddy CN.app' "$NO_CB_STDERR"
+
+# 14) Default acp mode with no codebuddy in PATH also exits 4 with the
+#     same diagnostic (regression: P0-#1 fix must not regress this path).
+out="$(env -i HOME="$REAL_HOME" PATH="/usr/bin:/bin" BASH_ENV="$NO_CB_BASH_ENV" \
+  "$SCRIPT" --no-log '用 5 个字说 hi' 2>/tmp/no_cb_stderr2)"
+rc=$?
+rm -f /tmp/no_cb_stderr2
+assert_exit "no codebuddy in acp mode exits 4" 4 "$rc" "$out"
+
+# 15) CODEBUDDY_BIN env var overrides the missing-PATH check (the
+#     script's behavior when CB_BIN resolves to a real binary). This
+#     locks in the documented alt-install path.
+out="$(env -i HOME="$REAL_HOME" PATH="/usr/bin:/bin" BASH_ENV="$NO_CB_BASH_ENV" \
+  CODEBUDDY_BIN="$(command -v codebuddy)" \
+  "$SCRIPT" --mode print --no-log '用 5 个字说 hi' 2>/dev/null)"
+rc=$?
+assert_exit "CODEBUDDY_BIN override reaches codebuddy, exit=0" 0 "$rc" "$out"
+assert_grep "CODEBUDDY_BIN override returns codebuddy reply" '你好' "$out"
+
+# Cleanup
+rm -f "$NO_CB_BASH_ENV"
 
 echo
 echo "===== smoke.sh: $pass passed, $fail failed ====="

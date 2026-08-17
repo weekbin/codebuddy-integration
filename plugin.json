@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "codebuddy-integration",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "给 mcode 增加一个调用 codebuddy 的入口。翻译、长文摘要、想要个不同意见、换种思路重写代码这种纯文字任务,可以转给 codebuddy 处理,花的是 codebuddy 自己的 credits,不消耗 mcode token。",
   "author": {
     "name": "weekbin",

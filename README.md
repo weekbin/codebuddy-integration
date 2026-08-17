@@ -102,18 +102,28 @@ ACP and print modes do **not** require `orca-ide`.
 
 - MiniMax Code with Agent Plugins 1.0 support.
 - `codebuddy` CLI on `$PATH` (any recent build of `@tencent-ai/codebuddy-code`).
+  If `command -v codebuddy` is empty, set `CODEBUDDY_BIN=/abs/path/to/codebuddy`
+  instead of symlinking. The error message printed on a missing CLI lists the
+  three common fix paths.
 - `python3` on `$PATH` (used by the ACP worker and by JSON parsing helpers).
 - `systemd-run --user` for the ACP background mode (Linux only); the script
-  transparently falls back to `setsid` on systems without systemd.
-- (TUI mode only) `orca-ide` on `$PATH` and a running orca worktree context. **If you pass
-  `--mode tui` and `orca-ide` is not installed, the script falls back to `--mode print`
-  automatically and prints a warning to stderr — so plugin-level failure is never
-  caused by a missing `orca-ide`.**
+  transparently falls back to `setsid` on systems without systemd (incl. macOS).
+- (`--mode tui` only) `orca-ide` on `$PATH` and a running orca worktree context.
+  **If you pass `--mode tui` and `orca-ide` is not installed, the script falls
+  back to `--mode print` automatically and prints a warning to stderr — so
+  plugin-level failure is never caused by a missing `orca-ide`.**
 - (Optional, recommended) `inotifywait` for zero-CPU `--await` waits. Without it
   the script polls every 1 s, which is still fine for tasks ≥ 5 s.
 - (TUI mode) `jq` is **not** required for TUI. (ACP / subagent worker only) `jq`
   is required because `bin/invoke-codebuddy-bridge.sh` uses `jq -r .handle` to
   extract the handle from the `--json --background` output.
+
+> **`~/.codebuddy/bin/` is the CodeBuddy CN.app (GUI) install dir on macOS,
+> not the codebuddy CLI.** The CLI is an npm package
+> (`@tencent-ai/codebuddy-code`) and lands under your node version manager
+> (`~/.nvm/versions/node/<v>/bin/`, `~/.local/bin/`, etc.). If
+> `command -v codebuddy` is empty but `ls ~/.codebuddy/bin/` shows a
+> `buddycn` symlink, you are looking at the wrong directory.
 
 ## Examples
 
