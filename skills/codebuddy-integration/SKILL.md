@@ -82,3 +82,8 @@ worker is the right granularity for `task` workers), but be aware
 that the first call of a brand-new session is server-side cold
 (1.4% cache); calls 2+ warm to 98-99%.
 
+**Verify**: `status()` returns the same `codebuddy_pid` across all
+calls within one mcode session; expect a new pid across distinct
+`task()` worker sessions. The wrapper's log line
+`subprocess_respawn | pid=<new>` confirms the boundary was crossed.
+
