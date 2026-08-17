@@ -57,8 +57,11 @@ if [ ! -x "$SCRIPT" ]; then
   exit 1
 fi
 
-# Use a throwaway HOME/state so we don't pollute the real install
+# Use a throwaway HOME/state so we don't pollute the real install.
+# Save the real HOME FIRST so the 0.1.7 tests below can hand codebuddy
+# its real auth directory (codebuddy refuses to start with no auth).
 TMPHOME="$(mktemp -d)"
+REAL_HOME="$HOME"
 trap 'rm -rf "$TMPHOME"' EXIT
 export HOME="$TMPHOME"
 
@@ -164,6 +167,72 @@ if [ -f "$SKILL" ]; then
     fail=$((fail+1))
   fi
 fi
+
+echo
+echo "===== 0.1.7: orca-ide optional / TUI fall-back ====="
+echo "(each test below calls the real codebuddy CLI; ~5s per test, ~10s total)"
+
+# In the dev environment codebuddy and orca-ide both live under
+# /home/weekbin/.local/bin AND /usr/bin/orca-ide + /bin/orca-ide are
+# also real symlinks. There's no PATH-only way to "hide" orca-ide
+# from `command -v` (the only directories we can drop from PATH
+# would also break the script's `env` shebang and `python3` call).
+#
+# Instead, we use BASH_ENV to source a tiny file in the script's
+# OWN bash process. That file overrides the `command` builtin so
+# `command -v orca-ide` returns 1 while every other `command` call
+# (e.g. `command -v codebuddy`) keeps working.
+FAKE_BIN="$(mktemp -d -t cb-smoke-XXXXXX)/bin"
+mkdir -p "$FAKE_BIN"
+ln -sf "$(command -v codebuddy 2>/dev/null || echo /home/weekbin/.local/bin/codebuddy)" "$FAKE_BIN/codebuddy"
+BASH_ENV_FILE="$(mktemp -t cb-smoke-bashenv-XXXXXX.sh)"
+# Override `command` only for orca-ide lookups; fall through to
+# the real builtin for everything else. This is sourced by every
+# non-interactive bash that BASH_ENV points to (i.e. the script).
+cat > "$BASH_ENV_FILE" <<'EOF'
+command() {
+  if [ "$1" = "-v" ] && [ "$2" = "orca-ide" ]; then
+    return 1
+  fi
+  builtin command "$@"
+}
+EOF
+TEST_PATH="$FAKE_BIN:/usr/bin:/bin"
+
+# Sanity: prove the override works as expected. The script's bash
+# process will see orca-ide as missing.
+sanity_out="$(env -i PATH="$TEST_PATH" BASH_ENV="$BASH_ENV_FILE" bash -c 'command -v orca-ide; echo "rc=$?"')"
+if printf '%s' "$sanity_out" | grep -q 'rc=1'; then
+  log "PASS" "BASH_ENV override hides orca-ide from 'command -v' (rc=1)"
+  pass=$((pass+1))
+else
+  log "FAIL" "BASH_ENV override failed; TUI fall-back test will be inconclusive"
+  echo "  got: $sanity_out"
+  fail=$((fail+1))
+fi
+
+# 11) --mode tui without orca-ide falls back to print, exits 0,
+#     prints warning to stderr, prints result to stdout.
+#     NOTE: HOME must be the REAL home (not $TMPHOME) because codebuddy
+#     reads auth from ~/.codebuddy/. env -i is fine — the script's state
+#     dir is plugin-relative, not HOME-relative.
+out="$(env -i HOME="$REAL_HOME" PATH="$TEST_PATH" BASH_ENV="$BASH_ENV_FILE" "$SCRIPT" --mode tui --no-log '用 5 个字说 hi' 2>/tmp/tui_stderr)"
+rc=$?
+TUI_STDERR="$(cat /tmp/tui_stderr)"
+rm -f /tmp/tui_stderr
+assert_exit "TUI without orca-ide falls back, exit=0" 0 "$rc" "$out"
+assert_grep "TUI without orca-ide returns codebuddy reply" '你好' "$out"
+assert_grep "TUI without orca-ide prints warning to stderr" 'orca-ide' "$TUI_STDERR"
+
+# 12) --mode acp (default) without orca-ide still works (regression: acp never
+#     required orca-ide; this locks that in).
+out="$(env -i HOME="$REAL_HOME" PATH="$TEST_PATH" BASH_ENV="$BASH_ENV_FILE" "$SCRIPT" --no-log '用 5 个字说 hi' 2>/dev/null)"
+rc=$?
+assert_exit "ACP without orca-ide still works" 0 "$rc" "$out"
+assert_grep "ACP without orca-ide returns codebuddy reply" '你好' "$out"
+
+# Cleanup fake bin + BASH_ENV
+rm -rf "$(dirname "$FAKE_BIN")" "$BASH_ENV_FILE"
 
 echo
 echo "===== smoke.sh: $pass passed, $fail failed ====="

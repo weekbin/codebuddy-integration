@@ -4,6 +4,42 @@ All notable changes to this plugin are documented in this file. The format is ba
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.7] - 2026-08-17
+
+### Fixed (from live feedback during 0.1.6 install)
+
+- **`orca-ide` is now a true optional dependency** (was: silent hard
+  requirement for the `tui` mode path). Three concrete changes in
+  `bin/invoke-codebuddy`:
+  - `ORCA` default value is now `$(command -v orca-ide 2>/dev/null || true)`,
+    so the default is empty string when `orca-ide` is missing — no
+    hardcoded dependency left in the script header.
+  - When the caller explicitly passes `--mode tui` and `orca-ide` is
+    missing, the script **silently falls back to `--mode print`** with
+    a single warning line on stderr. The result is identical to
+    running `--mode print` directly; the call no longer exits with
+    `code 4` just because `orca-ide` is not installed.
+  - The unconditional `command -v "$ORCA"` check at the top of the
+    TUI block (which used to fail-fast with exit 4) is now redundant
+    and was removed; the fall-back gate at the top of the script
+    short-circuits the TUI block before the check.
+
+### Documented
+
+- `SKILL.md` "Modes" table now has a "Requires `orca-ide`?" column
+  that makes the optionality visible at a glance (`acp` and `print`
+  = No, `tui` = Yes with auto-fall-back).
+- `SKILL.md` "Troubleshooting" table reclassifies the `orca-ide not in
+  PATH` symptom from "error" to "warning + auto-fall-back" with
+  recovery "install orca-ide only if you actually need worktree-shared
+  codebuddy".
+- `README.md` Requirements section notes the auto-fall-back explicitly
+  so plugin-level failure is never caused by a missing `orca-ide`.
+
+### Changed
+
+- Bumped `plugin.json`, `SKILL.md` metadata to `0.1.7`.
+
 ## [0.1.6] - 2026-08-17
 
 ### Documented (no code change)

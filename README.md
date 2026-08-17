@@ -107,7 +107,10 @@ ACP and print modes do **not** require `orca-ide`.
 - `python3` on `$PATH` (used by the ACP worker and by JSON parsing helpers).
 - `systemd-run --user` for the ACP background mode (Linux only); the script
   transparently falls back to `setsid` on systems without systemd.
-- (TUI mode only) `orca-ide` on `$PATH` and a running orca worktree context.
+- (TUI mode only) `orca-ide` on `$PATH` and a running orca worktree context. **If you pass
+  `--mode tui` and `orca-ide` is not installed, the script falls back to `--mode print`
+  automatically and prints a warning to stderr — so plugin-level failure is never
+  caused by a missing `orca-ide`.**
 - (Optional, recommended) `inotifywait` for zero-CPU `--await` waits. Without it
   the script polls every 1 s, which is still fine for tasks ≥ 5 s.
 - (TUI mode) `jq` is **not** required for TUI. (ACP / subagent worker only) `jq`

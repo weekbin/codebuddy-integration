@@ -5,7 +5,7 @@ license: MIT
 compatibility: Requires MiniMax Code with Agent Plugins 1.0 support, the `codebuddy` CLI on $PATH, and (for shared worktree context) the `orca-ide` CLI.
 metadata:
   author: weekbin
-  version: "0.1.6"
+  version: "0.1.7"
 ---
 
 # codebuddy-integration — codebuddy as a subagent
@@ -89,14 +89,17 @@ If unsure, ask the user — the decision is theirs because it costs their credit
 
 `invoke-codebuddy` has three execution modes:
 
-| Mode | Default | Mechanism | Worktree access | Stream events | Use when |
-|------|---------|-----------|-----------------|---------------|----------|
-| `acp` | **yes** | `codebuddy --acp` over JSON-RPC 2.0 | cwd only (the bash's cwd) | full (`session/update` events) | text reasoning tasks where you want rich state (phase, tokens, trace) |
-| `tui` | no | `codebuddy` inside an orca-ide terminal | yes (shares the worktree) | none (TUI only) | codebuddy needs to read/edit files or run commands |
-| `print` | no | `codebuddy --print --output-format json` | no (fresh subprocess) | none | simplest, fastest (5-8s), no install/agent setup |
+| Mode | Default | Mechanism | Requires `orca-ide`? | Worktree access | Stream events | Use when |
+|------|---------|-----------|----------------------|-----------------|---------------|----------|
+| `acp` | **yes** | `codebuddy --acp` over JSON-RPC 2.0 | **No** | cwd only (the bash's cwd) | full (`session/update` events) | text reasoning tasks where you want rich state (phase, tokens, trace) |
+| `tui` | no | `codebuddy` inside an orca-ide terminal | **Yes** (optional; auto-falls-back to `print` if missing) | yes (shares the worktree) | none (TUI only) | codebuddy needs to read/edit files or run commands |
+| `print` | no | `codebuddy --print --output-format json` | **No** | no (fresh subprocess) | none | simplest, fastest (5-8s), no install/agent setup |
 
-The **default is `acp`**. Pass `--mode tui` when codebuddy needs to see/edit files in the
-current worktree; pass `--mode print` for a quick text-only call with no agent overhead.
+The **default is `acp`**, which works on **any system with `codebuddy` installed** —
+`orca-ide` is **not required**. Pass `--mode tui` only when codebuddy needs to see/edit files in
+the current worktree AND you have `orca-ide` installed; if you pass `--mode tui` and `orca-ide`
+is missing, the script prints a warning to stderr and silently falls back to `--mode print`,
+so you still get a result. Pass `--mode print` for the cheapest, fastest, no-side-effects call.
 
 ## Command surface
 
@@ -107,7 +110,7 @@ current worktree; pass `--mode print` for a quick text-only call with no agent o
 | `--follow` | false | reuse the handle from `state/handle`; implies `--keep` |
 | `--background` | false | do not wait for response; print handle and exit |
 | `--new-session` | false | force a fresh terminal (close any existing one in `state/handle` first) |
-| `--mode tui\|print` | `acp` (sugar: `tui` or `print` accepted) | `tui` = orca-ide terminal (worktree context); `print` = `codebuddy --print` (cleaner, no worktree) |
+| `--mode tui\|print` | `acp` (sugar: `tui` or `print` accepted) | `tui` = orca-ide terminal (worktree context); `print` = `codebuddy --print` (cleaner, no worktree). `tui` auto-falls-back to `print` if `orca-ide` is not in PATH. |
 | `--timeout <sec>` | 300 | max wait time for the response |
 | `--no-log` | false | skip writing to `logs/invocations.log` |
 | `--log [N]` | 20 | print last N invocations and exit |
@@ -563,7 +566,7 @@ Notes on this pattern:
 | Symptom | Cause | Recovery |
 |---------|-------|----------|
 | `invoke-codebuddy: 'codebuddy' not in PATH` | codebuddy CLI not installed or PATH broken | `command -v codebuddy`; reinstall from `npm i -g @tencent-ai/codebuddy-code` |
-| `invoke-codebuddy: 'orca-ide' not in PATH` | orca CLI not in PATH | inside orca terminal use `orca`; outside use `orca-ide` |
+| `invoke-codebuddy: 'orca-ide' not in PATH; TUI unavailable, falling back to --mode print` | `orca-ide` not installed; TUI mode was requested | **This is a warning, not an error.** The script automatically fell back to `--mode print` and returned a result. Install `orca-ide` and pass `--mode tui` explicitly if you actually need worktree-shared codebuddy. |
 | `(无可见回复 - 可能是长答案被 TUI 折叠)` | codebuddy's TUI truncated the response | re-run with `--keep` and read full output with `--status`; or use `--mode print` |
 | `--follow` says "I don't have a previous answer" | codebuddy's TUI was reset between turns | check the handle is still alive: `invoke-codebuddy --status $(cat state/handle)`; if not, use `--new-session` |
 | `invoke-codebuddy: need handle (arg or .../state/handle)` | `--status` / `--kill` with no handle and no stored handle | pass the handle explicitly, or use `--keep` / `--follow` first to create one |

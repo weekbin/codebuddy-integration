@@ -34,7 +34,8 @@ STATE_DIR="$SKILL_DIR/state"
 mkdir -p "$STATE_DIR" "$(dirname "$LOG_FILE")" 2>/dev/null || true
 
 # ── 常量 ──────────────────────────────────────────────
-ORCA=orca-ide
+# ORCA 是 optional. 只 TUI 模式用. 默认探测 orca-ide, 没装不报错, TUI 模式自动 fall back.
+ORCA="${ORCA:-$(command -v orca-ide 2>/dev/null || true)}"
 CB_BIN="${CODEBUDDY_BIN:-codebuddy}"
 TITLE="invoke-codebuddy"
 
@@ -217,10 +218,15 @@ esac
 
 [ -z "$TASK" ] && { usage; exit 2; }
 
-# ── 校验 ORCA / codebuddy (仅 TUI 需要, print/acp 走各自的 runtime) ──
-# print 模式直接 subprocess, 不依赖 orca
-# acp 模式 worker 自带 codebuddy 子进程 fallback, 不需要 upfront check
-# 只 TUI 模式真正需要 orca + codebuddy 都在
+# ── 校验 ORCA / codebuddy (orca-ide 是 optional) ──
+# print + acp 模式完全不依赖 orca-ide, 直接走子进程路径
+# TUI 模式依赖 orca-ide 开 worktree terminal; 探测不到 orca-ide 时自动 fall back 到 print 模式 + warn
+if [ "$MODE" = "tui" ] && [ -z "$ORCA" ]; then
+  echo "invoke-codebuddy: 'orca-ide' not in PATH; TUI unavailable, falling back to --mode print" >&2
+  MODE=print
+fi
+# codebuddy binary 在 print + acp + tui 三种模式都必需
+command -v "$CB_BIN" >/dev/null 2>&1 || { echo "invoke-codebuddy: '$CB_BIN' not in PATH" >&2; exit 4; }
 
 # ── print 模式: 简单 subprocess, 干净 JSON 输出 ─────────
 if [ "$MODE" = "print" ]; then
@@ -298,9 +304,9 @@ print(json.dumps({'ok': $RC == 0, 'mode': 'acp', 'handle': '$HANDLE', 'duration_
 fi
 
 # ── TUI 模式: 通过 orca-ide terminal ─────────────────
-# 依赖检查: TUI 模式才需要 orca + codebuddy 都在
-command -v "$ORCA" >/dev/null 2>&1 || { echo "invoke-codebuddy: '$ORCA' not in PATH" >&2; exit 4; }
-command -v "$CB_BIN" >/dev/null 2>&1 || { echo "invoke-codebuddy: '$CB_BIN' not in PATH" >&2; exit 4; }
+# Note: orca-ide 可用性已在 L220-228 区域 fall back 校验过. 这里 ORCA 一定有值.
+# (这个块只在 MODE=tui 时跑; 探测不到 orca-ide 时上面已经改成 MODE=print)
+# codebuddy binary 同样在 L220-228 已校验
 
 # 决定用哪个 handle
 if [ "$FOLLOW" = true ] && [ "$NEW_SESSION" = false ]; then
