@@ -28,7 +28,7 @@ async def main():
             tools_resp = await session.list_tools()
             names = [t.name for t in tools_resp.tools]
             print(f"✓ tools/list: {names}")
-            expected = {"prompt", "continue", "status", "list_tasks"}
+            expected = {"prompt", "continue", "status", "list_tasks", "list_models"}
             assert set(names) == expected, f"expected {expected}, got {set(names)}"
             results = []
             for i in range(5):

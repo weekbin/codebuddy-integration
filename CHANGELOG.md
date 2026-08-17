@@ -4,6 +4,68 @@ All notable changes to this plugin are documented in this file. The format is ba
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] - 2026-08-18
+
+### Fixed
+
+- **Long replies were truncated to the first `agent_message_chunk`**:
+  the `if kind == "agent_message_chunk" and not message` guard in
+  `prompt()` only collected the first chunk, so any reply longer than
+  a single streaming segment came back as 1-3 chars even when the model
+  had generated 1000+ tokens. Verified before fix: a 2694-token LRU-cache
+  reply came back as `"写一个"`. Fix: drop the `and not message` guard
+  and concatenate every chunk. Verified after fix: 3617-token reply
+  captured as 14267 chars (ratio 3.94, healthy for mixed Chinese + code).
+  The `r.get("text")` seed is still kept so older server builds that
+  return the full body in the immediate response keep working.
+- **`--model X` was being passed through `session/new` JSON-RPC
+  `params.model`, which the codebuddy server silently ignored**:
+  calling `prompt(text, model="deepseek-v4-flash")` left `last_model`
+  pinned to `hy3` (the server default). The CLI accepts `--model X`
+  on the command line, but the wrapper only forwarded it through the
+  JSON-RPC path. Fix: thread `model` through `_spawn(append_text, model)`
+  so the `codebuddy --model X` flag is on the subprocess argv; when
+  `model=` changes mid-session, `_respawn(model=X)` tears down the old
+  subprocess and starts a new one with `--model X` on the new argv. The
+  respawn also re-passes the current `last_model` even when only
+  `append_system_prompt` changed, so a respawn-with-append doesn't reset
+  the model to the server default.
+
+### Added
+
+- **`list_models` tool** (5th MCP tool): parses `codebuddy --help` to
+  enumerate the supported model ids. Returns
+  `{ok, models: [id, ...], count, source}` on success or
+  `{ok: false, error, ...}` on failure. Cached per wrapper process.
+  Use it before passing `model=` to confirm the id is in the catalog
+  — the wrapper no longer has a hardcoded list, so it picks up new
+  models automatically when codebuddy is upgraded (and the wrapper
+  is restarted).
+
+### Tests
+
+- `tests/test_mcp_wrapper_unit.py`: 16 → 26 tests. Added
+  `TestListCodebuddyModels` (5 cases: canonical parse, tolerant of
+  unrelated parens, missing-line error, FileNotFoundError, cache
+  re-use), `TestSpawnArgsWithModel` (verifies `--model X` is on argv
+  when set and absent when not), `TestChunkConcatenation` (verifies
+  the truncation fix: 3 chunks concatenate correctly, 1-chunk case
+  still works), and a `list_models` dispatch case in
+  `TestToolHandlerDispatch`.
+- `tests/mcp-features-test.py`: now expects 5 tools, asserts
+  `list_models` returns ≥3 models including `hy3` and
+  `deepseek-v4-flash`, and adds two real-codebuddy cases:
+  (a) `model="deepseek-v4-flash"` triggers subprocess respawn AND
+  the subsequent `model=` field is actually `deepseek-v4-flash`
+  (no longer silently `hy3`); (b) `append_system_prompt` change
+  respawns while preserving the current model.
+- `tests/mcp-poc-test.py`: expected tool set bumped from 4 to 5.
+- `tests/mcp-long-prompt-test.py`: new file. One-off-style
+  integration test that sends the same LRU-cache prompt that
+  exposed the truncation bug pre-fix and asserts the captured
+  body is >200 chars and reasonably proportional to
+  `completion_tokens`.
+
 ## [0.3.1] - 2026-08-18
 
 ### Changed

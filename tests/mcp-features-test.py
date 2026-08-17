@@ -32,7 +32,7 @@ async def main() -> int:
             await session.initialize()
             tools = await session.list_tools()
             names = sorted(t.name for t in tools.tools)
-            assert names == sorted(["prompt", "continue", "status", "list_tasks"]), f"unexpected tools: {names}"
+            assert names == sorted(["prompt", "continue", "status", "list_tasks", "list_models"]), f"unexpected tools: {names}"
             print(f"✓ tools/list: {names}")
             r = await session.call_tool("status", {})
             st = json.loads(r.content[0].text.split("\n", 1)[1])
@@ -40,6 +40,13 @@ async def main() -> int:
             assert st["alive"] is True; assert st["call_count"] == 0
             assert st["acp_session_id"]; assert st["codebuddy_pid"] is not None
             print(f"✓ status: pid={st['codebuddy_pid']}, acp_session={st['acp_session_id'][:8]}...")
+            r = await session.call_tool("list_models", {})
+            lm = json.loads(r.content[0].text.split("\n", 1)[1])
+            assert lm["ok"] is True, f"list_models failed: {lm}"
+            assert lm["count"] >= 3, f"expected >=3 models, got {lm['count']}: {lm['models']}"
+            assert "hy3" in lm["models"], f"hy3 missing from {lm['models']}"
+            assert "deepseek-v4-flash" in lm["models"], f"deepseek-v4-flash missing from {lm['models']}"
+            print(f"✓ list_models: {lm['count']} models, includes hy3 + deepseek-v4-flash")
             for i in range(3):
                 r = await session.call_tool("prompt", {"text": f"用 5 个字说 hi, 第 {i+1} 次"})
                 txt = r.content[0].text; pid, model, dur = parse_pid_and_dur(txt); pids.append(pid)
@@ -65,15 +72,25 @@ async def main() -> int:
             txt = r.content[0].text; pid_after_model, _, _ = parse_pid_and_dur(txt)
             assert pid_after_model == pids[0], f"same model should not respawn; got pid {pid_after_model}"
             print(f"✓ prompt with same model: pid unchanged ({pid_after_model})")
+            # Switch to deepseek-v4-flash — must respawn the subprocess and the
+            # subsequent prompt should report the new model id.
+            r = await session.call_tool("prompt", {"text": "用 5 个字说 switch", "model": "deepseek-v4-flash"})
+            txt = r.content[0].text; pid_after_switch, model_after_switch, _ = parse_pid_and_dur(txt)
+            assert pid_after_switch != pids[0], f"model change should respawn; pid {pid_after_switch} == {pids[0]} (no respawn)"
+            assert model_after_switch == "deepseek-v4-flash", f"expected deepseek-v4-flash, got {model_after_switch}"
+            pids.append(pid_after_switch)
+            print(f"✓ model switch to deepseek-v4-flash triggered respawn: pid {pids[0]} → {pid_after_switch}, model={model_after_switch}")
             r = await session.call_tool("prompt", {"text": "现在回答 short", "append_system_prompt": "Always answer in exactly 3 words."})
-            txt = r.content[0].text; pid_after_append, _, _ = parse_pid_and_dur(txt)
-            assert pid_after_append != pids[0], f"append change should respawn; pid {pid_after_append} == {pids[0]} (no respawn)"
+            txt = r.content[0].text; pid_after_append, model_after_append, _ = parse_pid_and_dur(txt)
+            assert pid_after_append != pid_after_switch, f"append change should respawn; pid {pid_after_append} == {pid_after_switch} (no respawn)"
+            assert model_after_append == "deepseek-v4-flash", f"append respawn should preserve model, got {model_after_append}"
             pids.append(pid_after_append)
-            print(f"✓ append_system_prompt triggered respawn: pid {pids[0]} → {pid_after_append}")
+            print(f"✓ append_system_prompt respawned AND preserved model deepseek-v4-flash: pid {pid_after_switch} → {pid_after_append}")
             r = await session.call_tool("status", {})
             st = json.loads(r.content[0].text.split("\n", 1)[1])
-            assert st["call_count"] == 6; assert st["codebuddy_pid"] == pid_after_append
-            print(f"✓ status: call_count={st['call_count']}, pid={st['codebuddy_pid']} matches post-respawn")
+            assert st["call_count"] == 7; assert st["codebuddy_pid"] == pid_after_append
+            assert st["model"] == "deepseek-v4-flash", f"status model should be deepseek-v4-flash, got {st['model']}"
+            print(f"✓ status: call_count={st['call_count']}, pid={st['codebuddy_pid']}, model={st['model']}")
             r = await session.call_tool("list_tasks", {"limit": 2})
             items = json.loads(r.content[0].text.split("\n", 1)[1])
             assert len(items) == 2
@@ -82,7 +99,7 @@ async def main() -> int:
         print(f"\n✗ {len(failures)} FAILED:")
         for f in failures: print(f"  - {f}")
         return 1
-    print("\n✓ ALL FEATURES PASSED: status / list_tasks / continue / model / append / cache")
+    print("\n✓ ALL FEATURES PASSED: status / list_tasks / list_models / continue / model-switch / append / cache")
     return 0
 
 
