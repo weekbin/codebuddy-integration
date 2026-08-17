@@ -52,11 +52,20 @@ This is a **Skill-only Plugin** containing one Skill plus a CLI binary:
     (`codebuddy --print`).
 - `bin/invoke-codebuddy-acp-worker.py` — the Python JSON-RPC 2.0 client used by
   ACP mode to stream every event to disk (events JSONL, status JSON, result file,
-  done marker).
+  done marker). Knows how to read the mcode base system prompt and inject it via
+  `--append-system-prompt` (per the "base + 业务" strategy below).
 - `bin/invoke-codebuddy-bridge.sh` — a one-line wrapper that does
   `--background` + `--await` for the mavis worker's bash tool, so the worker
   prompt can be one line and the worker's LLM usage is near zero. See
   "Subagent integration" in `skills/codebuddy-integration/SKILL.md`.
+- `bin/install.sh` — first-time setup. Writes `$HOME/.config/invoke-codebuddy/install-path`
+  and `ln -sfn` the script to `~/bin/invoke-codebuddy`. Re-run after editing the
+  plugin in place.
+- `assets/mcode-base-system-prompt.md` — the **固化** mcode(Mavis) base system
+  prompt. Injected into every acp call by default so codebuddy knows it's a
+  Mavis/MiniMax Code subagent, not a free-standing assistant. Callers can
+  override it (`--system-prompt` / `--system-prompt-file`) or append business
+  rules after it (`--append-system-prompt`).
 
 The plugin never carries `codebuddy` credentials, never opens network sockets of
 its own, and never spawns anything that mcode's own tools could not have spawned
@@ -68,19 +77,34 @@ themselves. The only new behavior is **policy** ("when to delegate") and **ergon
 1. Install the **codebuddy** CLI and make sure it is on `$PATH`:
    `npm i -g @tencent-ai/codebuddy-code && command -v codebuddy`
 2. Install this plugin through your MiniMax Code plugin manager.
-3. Symlink the bundled script so the command works in your shell:
+3. Run `bin/install.sh` (from the plugin root or any path):
    ```bash
-   ln -sf "<plugin-root>/bin/invoke-codebuddy" "$HOME/bin/invoke-codebuddy"
-   command -v invoke-codebuddy
+   /path/to/plugin/bin/install.sh
    ```
-   `<plugin-root>` is wherever MiniMax Code unzips the plugin (e.g.
-   `~/.minimax/plugins/weekbin/codebuddy-integration`). The script uses
-   `readlink -f` to resolve its real location, so a symlink does not break its
-   `state/handle` and `logs/invocations.log` lookups.
+   This will:
+   - write `$HOME/.config/invoke-codebuddy/install-path` (so the script knows
+     where its plugin root is, even if `~/bin/invoke-codebuddy` is a symlink
+     pointing somewhere else),
+   - `ln -sfn <plugin-root>/bin/invoke-codebuddy ~/bin/invoke-codebuddy`,
+   - smoke-test that `--help` runs.
+   Re-run after editing the plugin in place to refresh the symlink.
 4. (Optional, only for `--mode tui` to share the current orca worktree) make sure
    `orca-ide` is on `$PATH`: `command -v orca-ide`.
 
 ACP and print modes do **not** require `orca-ide`.
+
+### How plugin root is resolved
+
+When the script runs, it figures out where its plugin root is in this order:
+
+1. `CODEBUDDY_PLUGIN_DIR` env var (mavis / mcode can inject this when it
+   installs the plugin),
+2. `$HOME/.config/invoke-codebuddy/install-path` (written by `bin/install.sh`),
+3. `readlink -f "$0"` of the script itself (fallback).
+
+This means **no matter which `~/bin/invoke-codebuddy` symlink is in effect, the
+`state/` and `logs/` directories always live inside the plugin that was
+installed.**
 
 ## Data and network
 
@@ -141,13 +165,58 @@ invoke-codebuddy --await "$HANDLE"
 
 # inspect token usage after a background task finishes
 invoke-codebuddy --metrics "$HANDLE"
+
+# pick a model (default: let codebuddy server choose)
+invoke-codebuddy --model glm-5.2 "review this 200-line function for race conditions"
+
+# completely replace the mcode base system prompt
+invoke-codebuddy --system-prompt-file ./my-strict-reviewer.md "review this PR"
+
+# keep the mcode base, append business rules
+invoke-codebuddy --append-system-prompt "You are reviewing for a fintech PCI-DSS audit." \
+  "list all hardcoded secrets in this diff"
 ```
+
+## Model selection
+
+`--model` is fully caller-controlled. If you don't pass it, codebuddy picks
+its own server-side default (currently `hy3` as of writing). Use
+`--model <id>` to pin one — `available_models` from any prior call's
+`--metrics` output lists what's reachable (e.g. `hy3`, `glm-5.2`,
+`deepseek-v4-pro`, `kimi-k3-1`, ...). You can also set `CODEBUDDY_MODEL` env
+var to make it a sticky default for your shell.
+
+## System prompt strategy
+
+The plugin ships a **固化** mcode base system prompt at
+`assets/mcode-base-system-prompt.md`. Every acp-mode call injects it by
+default, so codebuddy always knows it's a Mavis subagent (and what that
+means for roles, boundaries, output style).
+
+Callers have three options:
+
+| Caller intent                                    | Flag                                | codebuddy gets                         |
+|--------------------------------------------------|-------------------------------------|----------------------------------------|
+| Use base only, no business rules                 | _(no flag)_                         | base via `--append-system-prompt`      |
+| Use base + business rules                        | `--append-system-prompt "rule"`     | `base + rule` via `--append-system-prompt` |
+| Completely replace base (e.g. raw translation)   | `--system-prompt "..."` or `--system-prompt-file <path>` | just the caller's prompt (base skipped) |
+
+`--mode print` deliberately does **not** inject the base (to stay lightweight).
+Use `--mode acp` (the default) when you want the base.
+
+> **Why not just concatenate into `--system-prompt`?** Because codebuddy's
+> `append-system-prompt` lets the caller-supplied rules land *after* the
+> plugin's base, so the base is always present and the caller's text always
+> wins on conflict — matches the "基础 + 业务拼接" mental model.
 
 ## Limitations
 
-- Each call costs ~28k codebuddy input tokens (system prompt + tool catalog) plus
-  the actual prompt. Tiny prompts still burn ~30k credits. Prefer one well-formed
-  prompt over many retries.
+- Each call costs ~24k codebuddy input tokens on first invocation (system prompt
+  + tool catalog). On **subsequent calls the system prompt + tool catalog is
+  almost entirely cache-hit** (observed: `cache_read_tokens` ≈ `prompt_tokens`
+  in `--metrics` output), so a 100-call session costs roughly 24k + 99 ×
+  a-few-hundred-tokens rather than 100 × 24k. So long-running sessions are
+  significantly cheaper than the per-call number suggests.
 - TUI mode captures the first `● ...` segment of codebuddy's reply; very long
   answers are folded. Use `--keep` + `--status` or fall back to `--mode print`
   when you need the full text.

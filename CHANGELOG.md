@@ -4,6 +4,48 @@ All notable changes to this plugin are documented in this file. The format is ba
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-08-17
+
+### Added
+
+- **`--model <id>` flag** — caller controls codebuddy model. Default is now
+  "let codebuddy server pick" (no longer hardcoded `hy3`). Either pass the
+  flag or set `CODEBUDDY_MODEL` env var. `--metrics` on any prior call
+  lists `available_models`.
+- **`--system-prompt <text>` and `--system-prompt-file <path>`** —
+  completely replace the mcode base system prompt with caller-supplied
+  content. (acp mode; print mode already had it via codebuddy directly.)
+- **`--append-system-prompt <text>`** — append business rules **after**
+  the mcode base system prompt. Lets the caller keep mcode role/boundary
+  guarantees while adding task-specific instructions.
+- **`bin/install.sh`** — first-time setup script. Writes
+  `$HOME/.config/invoke-codebuddy/install-path` (anchors plugin root for
+  state/ and logs/ lookup), `ln -sfn` the script to `~/bin/`, and smoke-
+  tests `--help`. Re-run after editing the plugin in place.
+- **`assets/mcode-base-system-prompt.md`** — the **固化** mcode base
+  system prompt. Injected into every acp-mode call by default via
+  `codebuddy --append-system-prompt`. Aligned with mavis 2.x system
+  prompt (2026-08); bump in CHANGELOG when mavis system prompt changes
+  materially.
+- **`status.system_prompt_mode`** in acp status JSON — reflects which
+  of the four modes the call was in: `caller-override-file`,
+  `caller-override`, `caller-append`, `base-only`, `none`.
+
+### Changed
+
+- Plugin root resolution now uses a **3-level fallback** (instead of pure
+  `readlink -f "$0"`):
+  1. `$CODEBUDDY_PLUGIN_DIR` env var (mavis / mcode can inject at install),
+  2. `$HOME/.config/invoke-codebuddy/install-path` (written by install.sh),
+  3. `readlink -f "$0"` (backward-compat fallback).
+  This ensures `state/` and `logs/` always live inside the installed
+  plugin, no matter which symlink is on `~/bin/`.
+- `bin/invoke-codebuddy-acp-worker.py`: `--model` default is now `None`
+  (was `hy3`); `--model` is only added to `session/new` JSON if set.
+- `SKILL.md` / `README.md`: documented install.sh, model selection, system
+  prompt strategy, and the **cache economics** (first call ~24k tokens,
+  subsequent calls almost entirely cache-hit).
+
 ## [0.1.8] - 2026-08-17
 
 ### Fixed (from cross-machine gap report on 0.1.7 install)

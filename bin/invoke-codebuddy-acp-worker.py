@@ -256,25 +256,54 @@ class Worker(ACPClient):
         write_status(self.status_file, self.status)
 
 # ── Main flow ─────────────────────────────────────────
-def run(task: str, model: str, events_file: Path, status_file: Path,
-        result_file: Path, done_file: Path, timeout: int) -> int:
+def run(task: str, model: str | None, events_file: Path, status_file: Path,
+        result_file: Path, done_file: Path, timeout: int,
+        system_prompt: str | None = None,
+        system_prompt_file: str | None = None,
+        append_system_prompt: str | None = None,
+        mcode_base_prompt_file: str | None = None) -> int:
     # Spawn codebuddy --acp
+    cb_args = [
+        "codebuddy", "--acp",
+        # --dangerously-skip-permissions: main session's tool permission gate
+        # --permission-mode bypassPermissions: same as -y, but explicit
+        # --subagent-permission-mode bypassPermissions: CRITICAL —
+        #   codebuddy's own subagents/teammates run their own permission
+        #   system; without this they ask the user (who is unavailable
+        #   in this worker context) and the task hangs at
+        #   `waiting_for_permission` until bridge times out.
+        # --no-session-persistence: do not keep history across calls
+        "--dangerously-skip-permissions",
+        "--permission-mode", "bypassPermissions",
+        "--subagent-permission-mode", "bypassPermissions",
+        "--no-session-persistence",
+    ]
+    # system prompt 注入策略(对应 status.system_prompt_mode 字段):
+    #   - 调用方传 --system-prompt-file → 完全覆盖,不用 base     ("caller-override-file")
+    #   - 调用方传 --system-prompt      → 完全覆盖,不用 base     ("caller-override")
+    #   - 调用方传 --append-system-prompt → base + 业务追加     ("caller-append")
+    #   - 什么都没传                     → base 替换默认         ("base-only")
+    # base 文件不在 --append-system-prompt-file(不存在),所以用 --append-system-prompt 传文本
+    base_text = ""
+    if mcode_base_prompt_file and Path(mcode_base_prompt_file).is_file():
+        base_text = Path(mcode_base_prompt_file).read_text(encoding="utf-8").rstrip() + "\n\n"
+    if system_prompt_file:
+        cb_args += ["--system-prompt-file", system_prompt_file]
+        mode = "caller-override-file"
+    elif system_prompt:
+        cb_args += ["--system-prompt", system_prompt]
+        mode = "caller-override"
+    elif append_system_prompt:
+        cb_args += ["--append-system-prompt", base_text + append_system_prompt]
+        mode = "caller-append"
+    elif base_text:
+        cb_args += ["--append-system-prompt", base_text.rstrip()]
+        mode = "base-only"
+    else:
+        mode = "none"
     try:
         proc = subprocess.Popen(
-            # --acp: JSON-RPC 2.0 protocol
-            # --dangerously-skip-permissions: main session's tool permission gate
-            # --permission-mode bypassPermissions: same as -y, but explicit
-            # --subagent-permission-mode bypassPermissions: CRITICAL —
-            #   codebuddy's own subagents/teammates run their own permission
-            #   system; without this they ask the user (who is unavailable
-            #   in this worker context) and the task hangs at
-            #   `waiting_for_permission` until bridge times out.
-            # --no-session-persistence: do not keep history across calls
-            ["codebuddy", "--acp",
-             "--dangerously-skip-permissions",
-             "--permission-mode", "bypassPermissions",
-             "--subagent-permission-mode", "bypassPermissions",
-             "--no-session-persistence"],
+            cb_args,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, bufsize=0,
         )
@@ -283,13 +312,14 @@ def run(task: str, model: str, events_file: Path, status_file: Path,
         return 3
 
     w = Worker(proc, events_file, status_file, task)
-    w.status["model"] = model
+    w.status["model"] = model  # None = 让 codebuddy server 自选
+    w.status["system_prompt_mode"] = mode
 
     # 1) initialize
     try:
         w.call("initialize", {
             "protocolVersion": 1,
-            "clientInfo": {"name": "invoke-codebuddy", "version": "0.4"},
+            "clientInfo": {"name": "invoke-codebuddy", "version": "0.5"},
             "capabilities": {},
         }, timeout=15)
     except Exception as e:
@@ -299,13 +329,15 @@ def run(task: str, model: str, events_file: Path, status_file: Path,
 
     append_event(events_file, {"kind": "initialized"})
 
-    # 2) session/new
+    # 2) session/new — model 字段只有显式传了才带,否则让 codebuddy server 选
+    session_new_params = {
+        "cwd": os.getcwd(),
+        "mcpServers": [],
+    }
+    if model is not None:
+        session_new_params["model"] = model
     try:
-        r = w.call("session/new", {
-            "cwd": os.getcwd(),
-            "mcpServers": [],
-            "model": model,
-        }, timeout=30)
+        r = w.call("session/new", session_new_params, timeout=30)
     except Exception as e:
         sys.stderr.write(f"session/new failed: {e}\n")
         proc.terminate()
@@ -387,17 +419,37 @@ def run(task: str, model: str, events_file: Path, status_file: Path,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--task", required=True)
-    ap.add_argument("--model", default="hy3")
+    ap.add_argument("--model", default=None,
+                    help="codebuddy model id; 不传 = 先看 CODEBUDDY_MODEL env, "
+                         "再 fallback 到 None (让 server 自选)。")
+    ap.add_argument("--system-prompt", default=None,
+                    help="完全覆盖默认 system prompt(短文本)。")
+    ap.add_argument("--system-prompt-file", default=None,
+                    help="完全覆盖默认 system prompt(从文件读,长文本友好)。")
+    ap.add_argument("--append-system-prompt", default=None,
+                    help="在 plugin 内置 mcode base system prompt 之后追加(短文本)。")
+    ap.add_argument("--mcode-base-prompt-file", default=None,
+                    help="plugin 内置的 mcode base system prompt 文件路径。"
+                         "worker 会自动读这个文件,在 caller-append 模式下拼到业务规则之前,"
+                         "在 base-only 模式下作为唯一的 system prompt 内容。"
+                         "对应 invoke-codebuddy 的 assets/mcode-base-system-prompt.md。")
     ap.add_argument("--events-file", required=True, type=Path)
     ap.add_argument("--status-file", required=True, type=Path)
     ap.add_argument("--result-file", required=True, type=Path)
     ap.add_argument("--done-file", required=True, type=Path)
     ap.add_argument("--timeout", type=int, default=300)
     args = ap.parse_args()
+    # --model 解析顺序: CLI > env > None
+    if args.model is None:
+        args.model = os.environ.get("CODEBUDDY_MODEL")
     for p in [args.events_file, args.status_file, args.result_file, args.done_file]:
         p.parent.mkdir(parents=True, exist_ok=True)
     rc = run(args.task, args.model, args.events_file, args.status_file,
-             args.result_file, args.done_file, args.timeout)
+             args.result_file, args.done_file, args.timeout,
+             system_prompt=args.system_prompt,
+             system_prompt_file=args.system_prompt_file,
+             append_system_prompt=args.append_system_prompt,
+             mcode_base_prompt_file=args.mcode_base_prompt_file)
     sys.exit(rc)
 
 if __name__ == "__main__":

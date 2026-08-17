@@ -23,12 +23,25 @@
 #   invoke-codebuddy --mode print "纯文本任务"              # 不走 TUI，用 codebuddy --print
 #   invoke-codebuddy --new-session                         # 强制新会话
 #   invoke-codebuddy --log                                 # 看本次最近调用记录
+#   invoke-codebuddy --model glm-5.2 "..."                 # 指定 model (默认让 codebuddy server 自选)
+#   invoke-codebuddy --append-system-prompt "rule" "..."    # 业务 system prompt 拼在 plugin base 之后
+#   invoke-codebuddy --system-prompt-file <file> "..."      # 完全替换 plugin base system prompt
 set -eo pipefail
 
-# ── 路径固化 (相对脚本位置，不依赖调用方 cwd) ─────────────
+# ── 路径解析: 三级回退,确保 state/ 和 logs/ 永远写在"被 mcode 安装的 plugin 目录"里 ─
+#   1. CODEBUDDY_PLUGIN_DIR env (mcode 安装时可注入)
+#   2. $HOME/.config/invoke-codebuddy/install-path (install.sh 写入)
+#   3. readlink 解析当前脚本位置 (向后兼容旧调用)
+INSTALL_PATH_FILE="${INVOKE_CODEBUDDY_INSTALL_PATH:-$HOME/.config/invoke-codebuddy/install-path}"
 SCRIPT_PATH="$(readlink -f "$0")"
-SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"                 # <plugin-root>/bin
-SKILL_DIR="$(dirname "$SCRIPT_DIR")"                   # <plugin-root>
+SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
+if [ -n "${CODEBUDDY_PLUGIN_DIR:-}" ] && [ -d "$CODEBUDDY_PLUGIN_DIR" ]; then
+  SKILL_DIR="$CODEBUDDY_PLUGIN_DIR"
+elif [ -f "$INSTALL_PATH_FILE" ] && [ -d "$(cat "$INSTALL_PATH_FILE" 2>/dev/null)" ]; then
+  SKILL_DIR="$(cat "$INSTALL_PATH_FILE")"
+else
+  SKILL_DIR="$(dirname "$SCRIPT_DIR")"                 # <plugin-root>
+fi
 HANDLE_FILE="${INVOKE_CODEBUDDY_HANDLE_FILE:-$SKILL_DIR/state/handle}"
 LOG_FILE="$SKILL_DIR/logs/invocations.log"
 STATE_DIR="$SKILL_DIR/state"
@@ -39,6 +52,15 @@ mkdir -p "$STATE_DIR" "$(dirname "$LOG_FILE")" 2>/dev/null || true
 ORCA="${ORCA:-$(command -v orca-ide 2>/dev/null || true)}"
 CB_BIN="${CODEBUDDY_BIN:-codebuddy}"
 TITLE="invoke-codebuddy"
+
+# plugin 内置的 mcode base system prompt — 默认替换 codebuddy 默认 system prompt。
+# 调用方用 --system-prompt(-file) 覆盖,或 --append-system-prompt 在 base 之后追加业务规则。
+MCODE_BASE_PROMPT_FILE="$SKILL_DIR/assets/mcode-base-system-prompt.md"
+if [ ! -f "$MCODE_BASE_PROMPT_FILE" ]; then
+  echo "invoke-codebuddy: WARN: base system prompt not found at $MCODE_BASE_PROMPT_FILE" >&2
+  echo "  → 继续执行,但 codebuddy 不会收到 mcode 角色约束。建议重跑 install.sh 同步 plugin。" >&2
+  MCODE_BASE_PROMPT_FILE=""
+fi
 
 JSON_OUT=false
 KEEP=false
@@ -52,6 +74,10 @@ LOG_THIS=true
 TASK=""
 CMD=""
 HANDLE=""
+MODEL=""
+SYSTEM_PROMPT=""
+SYSTEM_PROMPT_FILE=""
+APPEND_SYSTEM_PROMPT=""
 
 usage() {
   # Print only the leading # comment block, stopping at the first non-# line.
@@ -76,11 +102,26 @@ while [[ $# -gt 0 ]]; do
     --events)  CMD=events;  HANDLE="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
     --metrics) CMD=metrics; HANDLE="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
     --log) CMD=log; shift ;;
+    --model) MODEL="$2"; shift 2 ;;
+    --system-prompt) SYSTEM_PROMPT="$2"; shift 2 ;;
+    --system-prompt-file) SYSTEM_PROMPT_FILE="$2"; shift 2 ;;
+    --append-system-prompt) APPEND_SYSTEM_PROMPT="$2"; shift 2 ;;
     --help|-h) usage; exit 0 ;;
     -*) echo "invoke-codebuddy: unknown flag: $1" >&2; exit 2 ;;
     *)  TASK="$1"; shift ;;
   esac
 done
+
+# 校验 system prompt 参数: --system-prompt / --system-prompt-file 互斥(--file 优先)
+if [ -n "$SYSTEM_PROMPT" ] && [ -n "$SYSTEM_PROMPT_FILE" ]; then
+  echo "invoke-codebuddy: --system-prompt 与 --system-prompt-file 互斥,后者优先;忽略 --system-prompt" >&2
+  SYSTEM_PROMPT=""
+fi
+# --append-system-prompt(-file) 必须配合 base system prompt 才有意义;如果 base 缺失则报错
+if [ -n "$APPEND_SYSTEM_PROMPT" ] && [ -z "$MCODE_BASE_PROMPT_FILE" ]; then
+  echo "invoke-codebuddy: --append-system-prompt 需要 base system prompt,但 $SKILL_DIR/assets/mcode-base-system-prompt.md 不存在" >&2
+  exit 2
+fi
 
 # ── 工具 ────────────────────────────────────────────
 ts() { date +%Y-%m-%dT%H:%M:%S%z; }
@@ -240,10 +281,21 @@ if ! command -v "$CB_BIN" >/dev/null 2>&1; then
 fi
 
 # ── print 模式: 简单 subprocess, 干净 JSON 输出 ─────────
+# 注意: print 模式不注入 mcode base system prompt(为了轻量、避免读文件);
+#       base 只在 acp 模式生效。如果调用方需要 base,用 --mode acp(默认)。
 if [ "$MODE" = "print" ]; then
   T0=$(date +%s)
-  OUT=$($CB_BIN --print --output-format json --dangerously-skip-permissions \
-        --no-session-persistence "$TASK" 2>/dev/null \
+  # 构造 codebuddy CLI flags
+  CB_FLAGS=(--print --output-format json --dangerously-skip-permissions --no-session-persistence)
+  [ -n "$MODEL" ] && CB_FLAGS+=(--model "$MODEL")
+  if [ -n "$SYSTEM_PROMPT_FILE" ]; then
+    CB_FLAGS+=(--system-prompt-file "$SYSTEM_PROMPT_FILE")
+  elif [ -n "$SYSTEM_PROMPT" ]; then
+    CB_FLAGS+=(--system-prompt "$SYSTEM_PROMPT")
+  elif [ -n "$APPEND_SYSTEM_PROMPT" ]; then
+    CB_FLAGS+=(--append-system-prompt "$APPEND_SYSTEM_PROMPT")
+  fi
+  OUT=$("$CB_BIN" "${CB_FLAGS[@]}" "$TASK" 2>/dev/null \
         | python3 -c "
 import sys, json
 try:
@@ -280,13 +332,27 @@ if [ "$MODE" = "acp" ] && [ "$BG_MODE" = false ]; then
   STATUS_FILE="$STATE_DIR/status-$HANDLE.json"
   rm -f "$RESULT_FILE" "$DONE_FILE" "$EVENTS_FILE" "$STATUS_FILE"
   T0=$(date +%s)
+  # 构造 acp-worker 透传 flags
+  WORKER_FLAGS=(
+    --task "$TASK"
+    --events-file "$EVENTS_FILE"
+    --status-file "$STATUS_FILE"
+    --result-file "$RESULT_FILE"
+    --done-file "$DONE_FILE"
+    --timeout "$TIMEOUT"
+  )
+  [ -n "$MODEL" ] && WORKER_FLAGS+=(--model "$MODEL")
+  # base prompt 路径交给 worker 自己读(不在主脚本里展开)
+  [ -n "$MCODE_BASE_PROMPT_FILE" ] && WORKER_FLAGS+=(--mcode-base-prompt-file "$MCODE_BASE_PROMPT_FILE")
+  if [ -n "$SYSTEM_PROMPT_FILE" ]; then
+    WORKER_FLAGS+=(--system-prompt-file "$SYSTEM_PROMPT_FILE")
+  elif [ -n "$SYSTEM_PROMPT" ]; then
+    WORKER_FLAGS+=(--system-prompt "$SYSTEM_PROMPT")
+  elif [ -n "$APPEND_SYSTEM_PROMPT" ]; then
+    WORKER_FLAGS+=(--append-system-prompt "$APPEND_SYSTEM_PROMPT")
+  fi
   python3 "$SCRIPT_DIR/invoke-codebuddy-acp-worker.py" \
-    --task "$TASK" \
-    --events-file "$EVENTS_FILE" \
-    --status-file "$STATUS_FILE" \
-    --result-file "$RESULT_FILE" \
-    --done-file "$DONE_FILE" \
-    --timeout "$TIMEOUT" 2>/dev/null
+    "${WORKER_FLAGS[@]}" 2>/dev/null
   RC=$?
   T1=$(date +%s); DT=$((T1-T0))
   log_invoke "acp-sync" "n/a" "$HANDLE" "rc=$RC" "$DT" "$TASK"
@@ -355,26 +421,35 @@ if [ "$MODE" = "acp" ] && [ "$BG_MODE" = true ]; then
   EVENTS_FILE="$STATE_DIR/events-$HANDLE.jsonl"
   STATUS_FILE="$STATE_DIR/status-$HANDLE.json"
   rm -f "$RESULT_FILE" "$DONE_FILE" "$EVENTS_FILE" "$STATUS_FILE"
+  # 构造 acp-worker 透传 flags (与 sync 模式完全一致)
+  WORKER_FLAGS=(
+    --task "$TASK"
+    --events-file "$EVENTS_FILE"
+    --status-file "$STATUS_FILE"
+    --result-file "$RESULT_FILE"
+    --done-file "$DONE_FILE"
+    --timeout "$TIMEOUT"
+  )
+  [ -n "$MODEL" ] && WORKER_FLAGS+=(--model "$MODEL")
+  # base prompt 路径交给 worker 自己读(不在主脚本里展开)
+  [ -n "$MCODE_BASE_PROMPT_FILE" ] && WORKER_FLAGS+=(--mcode-base-prompt-file "$MCODE_BASE_PROMPT_FILE")
+  if [ -n "$SYSTEM_PROMPT_FILE" ]; then
+    WORKER_FLAGS+=(--system-prompt-file "$SYSTEM_PROMPT_FILE")
+  elif [ -n "$SYSTEM_PROMPT" ]; then
+    WORKER_FLAGS+=(--system-prompt "$SYSTEM_PROMPT")
+  elif [ -n "$APPEND_SYSTEM_PROMPT" ]; then
+    WORKER_FLAGS+=(--append-system-prompt "$APPEND_SYSTEM_PROMPT")
+  fi
   # 用 systemd-run --user --unit=NAME: 创建真正独立的 service unit
   # (不能加 --scope, 因为 --scope 绑到父进程生命周期, 父退出就死)
   # 这种 transient unit 在完成后会自动清理
   UNIT="invoke-codebuddy-acp-$$-$(date +%s)"
   if ! systemd-run --user --unit="$UNIT" \
     python3 "$SCRIPT_DIR/invoke-codebuddy-acp-worker.py" \
-      --task "$TASK" \
-      --events-file "$EVENTS_FILE" \
-      --status-file "$STATUS_FILE" \
-      --result-file "$RESULT_FILE" \
-      --done-file "$DONE_FILE" \
-      --timeout "$TIMEOUT" </dev/null >/dev/null 2>&1; then
+      "${WORKER_FLAGS[@]}" </dev/null >/dev/null 2>&1; then
     # fallback: setsid + 双 fork
     ( setsid python3 "$SCRIPT_DIR/invoke-codebuddy-acp-worker.py" \
-        --task "$TASK" \
-        --events-file "$EVENTS_FILE" \
-        --status-file "$STATUS_FILE" \
-        --result-file "$RESULT_FILE" \
-        --done-file "$DONE_FILE" \
-        --timeout "$TIMEOUT" </dev/null >/dev/null 2>&1 & ) &
+        "${WORKER_FLAGS[@]}" </dev/null >/dev/null 2>&1 & ) &
     disown 2>/dev/null || true
   fi
   log_invoke "acp-bg" "$KEEP" "$HANDLE" "spawned" "0" "$TASK"

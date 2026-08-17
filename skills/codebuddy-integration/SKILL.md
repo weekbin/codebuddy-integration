@@ -5,7 +5,7 @@ license: MIT
 compatibility: Requires MiniMax Code with Agent Plugins 1.0 support, the `codebuddy` CLI on $PATH (or `CODEBUDDY_BIN` env var pointing at it), and (for `--mode tui` only, otherwise optional) the `orca-ide` CLI.
 metadata:
   author: weekbin
-  version: "0.1.8"
+  version: "0.2.0"
 ---
 
 # codebuddy-integration — codebuddy as a subagent
@@ -37,8 +37,18 @@ invoke-codebuddy --follow "now translate to English"
 invoke-codebuddy --background "long task"        # returns handle + events/status/result file paths
 invoke-codebuddy --await <handle>                # blocks bash (0 mcode LLM tokens) until done
 invoke-codebuddy --result-file <handle>          # just prints the result file path
-invoke-codebuddy --metrics <handle>              # rich ACP state: phase / tokens / trace / by_category
+invoke-codebuddy --metrics <handle>              # rich ACP state: phase / tokens / trace / by_category / system_prompt_mode
 invoke-codebuddy --events <handle>               # full event stream (JSONL, all phase + thought + message + usage)
+
+# model selection (default: let codebuddy server pick; e.g. try glm-5.2 / deepseek-v4-pro)
+invoke-codebuddy --model glm-5.2 "review this code for race conditions"
+
+# keep the mcode base prompt, append business rules
+invoke-codebuddy --append-system-prompt "You are auditing for PCI-DSS. List every secret." \
+  "review this diff"
+
+# completely replace the mcode base prompt (rare; usually --append is enough)
+invoke-codebuddy --system-prompt-file ./strict-reviewer.md "review this PR"
 
 # async (TUI, when codebuddy needs to do real work in the worktree)
 #   - requires `orca-ide` on PATH; without it the script silently falls back
@@ -48,13 +58,13 @@ invoke-codebuddy --mode tui --background "edit this file"
 
 ### Mode cheat sheet
 
-| Mode | `--background`? | Needs `codebuddy`? | Needs `orca-ide`? | Use when |
-|------|-----------------|--------------------|-------------------|----------|
-| `print` (default for one-shot) | n/a | yes | **no** | first try, pure text, no worktree context |
-| `acp` (default) | n/a | yes | **no** | full ACP state + tokens + events; works without orca |
-| `acp` (default) + `--background` | yes | yes | **no** (uses `systemd-run` on Linux / `setsid` on macOS) | long task, fire-and-forget |
-| `tui` | n/a | yes | **yes** (with auto-fall-back to `print` if missing) | codebuddy needs to read/edit worktree files via orca-ide terminal |
-| `tui` + `--background` | yes | yes | **yes** (with auto-fall-back) | long task in worktree context |
+| Mode | `--background`? | Needs `codebuddy`? | Needs `orca-ide`? | Injects mcode base system prompt? | Use when |
+|------|-----------------|--------------------|-------------------|-----------------------------------|----------|
+| `print` (default for one-shot) | n/a | yes | **no** | **no** (lighter, faster) | first try, pure text, no worktree context |
+| `acp` (default) | n/a | yes | **no** | **yes** (default) | full ACP state + tokens + events; works without orca |
+| `acp` (default) + `--background` | yes | yes | **no** (uses `systemd-run` on Linux / `setsid` on macOS) | **yes** (default) | long task, fire-and-forget |
+| `tui` | n/a | yes | **yes** (with auto-fall-back to `print` if missing) | no (TUI is interactive) | codebuddy needs to read/edit worktree files via orca-ide terminal |
+| `tui` + `--background` | yes | yes | **yes** (with auto-fall-back) | no | long task in worktree context |
 
 ## Installation
 
@@ -65,9 +75,12 @@ After installing this plugin, three things must be true:
 3. The `orca-ide` CLI is on `$PATH` **only if you want `--mode tui`** — otherwise it is optional (the script will warn and fall back to `--mode print`).
 
 ```bash
-# 1) expose the script
-PLUGIN_ROOT="$(plugin-root)"   # e.g. ~/.minimax/plugins/codebuddy-integration
-ln -s "$PLUGIN_ROOT/bin/invoke-codebuddy" "$HOME/bin/invoke-codebuddy"
+# 1) expose the script — use the bundled install.sh
+"$PLUGIN_ROOT/bin/install.sh"
+#    ↳ writes $HOME/.config/invoke-codebuddy/install-path (anchors plugin root)
+#    ↳ ln -sfn $PLUGIN_ROOT/bin/invoke-codebuddy ~/bin/invoke-codebuddy
+#    ↳ smoke-tests --help
+# Re-run after editing the plugin in place.
 
 # 2) expose codebuddy (pick one)
 #    a) if it's already installed, just find it and put it on PATH:
@@ -91,10 +104,14 @@ ln -sf "$(command -v codebuddy 2>/dev/null || echo /path/to/codebuddy)" "$HOME/b
 > `command -v codebuddy` is empty but `ls ~/.codebuddy/bin/` shows a
 > `buddycn` symlink, you are looking at the wrong directory.
 
-`$(plugin-root)` is the directory containing this plugin (e.g. `~/.minimax/plugins/weekbin/codebuddy-integration`
-or wherever MiniMax Code unzips the plugin). The script uses `readlink -f "$0"` to resolve its
-real location, so the symlink does not break internal path lookups for `state/handle` and
-`logs/invocations.log`.
+`$PLUGIN_ROOT` is the directory containing this plugin (e.g. `~/.minimax/plugins/codebuddy-integration`).
+The script resolves its own plugin root in this priority order, so `state/handle` and
+`logs/invocations.log` always live inside the installed plugin — even if `~/bin/invoke-codebuddy`
+is a symlink pointing somewhere else:
+
+1. `$CODEBUDDY_PLUGIN_DIR` env var (mavis / mcode can inject this when it installs the plugin),
+2. `$HOME/.config/invoke-codebuddy/install-path` (written by `bin/install.sh`),
+3. `readlink -f "$0"` of the script itself (fallback).
 
 ## When to invoke
 
@@ -160,6 +177,10 @@ so you still get a result. Pass `--mode print` for the cheapest, fastest, no-sid
 | `--await <handle>` | — | **block** until the background task writes its result file, then print the result. Uses `inotifywait` if available, else polls every 1s. Burns 0 mcode LLM tokens. |
 | `--result-file <handle>` | — | print the absolute path of the result file (so mcode can `inotifywait` / `tail -f` it itself) |
 | `--kill [handle]` | — | close the codebuddy terminal; handle defaults to `state/handle` |
+| `--model <id>` | server default (currently `hy3`) | pin a codebuddy model id; use `--metrics <handle>` on any prior call to see `available_models` |
+| `--system-prompt <text>` | mcode base prompt | completely replace the mcode base system prompt with this text |
+| `--system-prompt-file <path>` | mcode base prompt | completely replace the mcode base system prompt with file contents |
+| `--append-system-prompt <text>` | _(none)_ | append business rules **after** the mcode base system prompt (text) |
 | `--help` | — | show usage |
 
 ### What comes back
@@ -172,9 +193,16 @@ so you still get a result. Pass `--mode print` for the cheapest, fastest, no-sid
 
 ## Cost and safety
 
-- Each `invoke-codebuddy` call costs ~28k codebuddy input tokens (system prompt + tool
-  catalog) plus the actual prompt. Output is typically 100-300 tokens. Even tiny prompts
-  burn ~30k credits.
+- **First call** in a session costs ~24k codebuddy input tokens (mcode base system
+  prompt + codebuddy's tool catalog). On **subsequent calls the system prompt and
+  tool catalog are almost entirely cache-hit** — observed: `cache_read_tokens` ≈
+  `prompt_tokens` in `--metrics` output. So a 100-call session costs roughly
+  24k + 99 × a-few-hundred-tokens rather than 100 × 24k. Long-running sessions
+  are significantly cheaper than the per-call number suggests.
+- `--mode print` skips the mcode base system prompt, so it is slightly cheaper
+  on the first call too (no base-prompt cache slot to populate). Use `--mode
+  print` for one-shot smoke tests; use `--mode acp` (default) for production
+  calls where the role/boundary guarantee matters.
 - The script manages terminal lifecycle through `state/handle` (configurable via
   `INVOKE_CODEBUDDY_HANDLE_FILE`). It **never** closes terminals by title matching — only
   handles it created. The user's own mcode sessions are untouched.
@@ -182,6 +210,30 @@ so you still get a result. Pass `--mode print` for the cheapest, fastest, no-sid
   every bash/edit; this is acceptable inside the user's own worktree.
 - If you call `invoke-codebuddy` many times in one mcode turn, accumulated codebuddy spend
   can be significant. Prefer one well-formed prompt over many retries.
+
+## System prompt
+
+The plugin ships a **固化** mcode (Mavis/MiniMax Code) base system prompt at
+`assets/mcode-base-system-prompt.md`. Every `acp`-mode call injects it by default
+(via `codebuddy`'s `--append-system-prompt` flag), so codebuddy always knows it's
+a Mavis subagent, what its role is, and what boundaries it has.
+
+| Caller intent                                    | Flag                                | What codebuddy sees                           |
+|--------------------------------------------------|-------------------------------------|------------------------------------------------|
+| Use base only, no business rules                 | _(no flag)_                         | just the mcode base                            |
+| Use base + business rules                        | `--append-system-prompt "rule"`     | mcode base + rule                              |
+| Completely replace base (e.g. raw translation)   | `--system-prompt "..."` or `--system-prompt-file <path>` | just the caller's prompt (base skipped) |
+
+`--mode print` deliberately does NOT inject the base (to stay lightweight). Use
+`--mode acp` (the default) when you want the base.
+
+## Model selection
+
+`--model` is **caller-controlled** — the plugin does not pick a default. If you
+omit it, codebuddy picks its own server-side default (currently `hy3` as of
+writing, but check `--metrics` for the live `available_models` list). To pin
+one: `--model glm-5.2`, `--model deepseek-v4-pro`, etc. You can also set
+`CODEBUDDY_MODEL` env var for a sticky default in your shell.
 
 ## Examples
 
