@@ -4,6 +4,21 @@ All notable changes to this plugin are documented in this file. The format is ba
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.5] - 2026-08-18
+
+### Removed
+- **`tests/mcp-set-model-probe-test.py`**: research script that discovered `session/set_config_option` is the runtime model-switch RPC. Results baked into `ACPSession._switch_model` (0.3.3). Kept no further value.
+- **`tests/mcp-traffic-capture-test.py`**: research script that classified `agent_message_chunk` / `agent_thought_chunk` / `tool_call` event streams. Results baked into `ACPSession.prompt` (0.3.3). Kept no further value.
+
+### Changed
+- **SKILL.md tightened** from 11 rules to 8 (combined "Async from the agent's perspective" into the "Long task" rule; folded "Long replies are full-length" and "Tool calls are always summarized" into the response format example; removed dated references like "Verified 2026-08-18" and "(0.3.3+)" version tags that distract the model).
+- **README.md expanded** with full MCP tool reference (5 tools + parameters), a "调用方式" section contrasting async (mcode `task` + `run_in_background=true`) vs sync (`mcp__codebuddy__prompt` direct), and a scenario table for choosing between them. "限制" section now reflects the 0.3.4 findings (shared wrapper, model serialization, 429 on default hy3).
+- **AGENTS.md refreshed**: version 0.3.0 → 0.3.5, tool count 4 → 5, wrapper line count ~430 → 685, unit test count 16 → 34, test list expanded from 3 to 4 (added `mcp-long-prompt-test.py`), future-work section reordered by priority with the streamable-http transport flagged as the path to real codebuddy concurrency.
+- **`.gitignore`**: added explicit `.pytest_cache/` entry (the directory was already effectively ignored via the inner pytest-generated `.gitignore`; this is just for clarity).
+
+### Kept
+- `tests/mcp-long-prompt-test.py` stays as a regression test for the 0.3.1 reply-truncation bug. The test self-skips on rate-limit 429.
+
 ## [0.3.4] - 2026-08-18
 
 ### Fixed

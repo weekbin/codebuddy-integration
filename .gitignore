@@ -4,6 +4,7 @@ logs/
 
 # Build / cache artifacts
 __pycache__/
+.pytest_cache/
 *.pyc
 *.pyo
 *.pyd
