@@ -1,7 +1,7 @@
 # codebuddy-integration
 
-> Skill + CLI 包装:把 mcode 上的翻译、长文摘要、想要个不同意见、换思路重写代码这类纯文字任务,
-> 转给 **codebuddy** 子代理处理——花 codebuddy 自己的 credits,不消耗 mcode token。
+> Skill + CLI 包装:给 mcode 增加一个调用 codebuddy 的入口,处理翻译、长文摘要、寻求不同意见、
+> 换思路重写代码这类纯文字任务。
 
 ## Try it
 
