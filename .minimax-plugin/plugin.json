@@ -3,7 +3,7 @@
   "name": "codebuddy-integration",
   "displayName": "Codebuddy Integration",
   "version": "0.1.6",
-  "description": "Skill and CLI wrapper that lets MiniMax Code delegate a text-reasoning task to a separate codebuddy subagent (spends codebuddy credits, not mcode tokens). Useful for second opinions, translations, long-context summaries, and fresh implementation drafts.",
+  "description": "给 mcode 增加一个调用 codebuddy 的入口。翻译、长文摘要、想要个不同意见、换种思路重写代码这种纯文字任务,可以转给 codebuddy 处理,花的是 codebuddy 自己的 credits,不消耗 mcode token。",
   "author": "weekbin",
   "category": "Code",
   "exampleQueries": [
