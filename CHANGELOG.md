@@ -4,6 +4,36 @@ All notable changes to this plugin are documented in this file. The format is ba
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-08-18
+
+### Changed
+
+- **`bin/codebuddy-mcp-server.py`**: dropped the 100 ms hard-coded sleep
+  in `prompt()` (the post-`_wait_id` `_drain_until_idle()` round). The
+  reader thread accumulates `usage_update` / `session_info_update`
+  notifications and `_drain_notifications()` already returns whatever
+  is buffered at call time; a fixed 100 ms wait was pure overhead on
+  the hot path. The `r.get("_meta", {}).get("usage")` fallback on the
+  response itself was already in place, so metadata is preserved when
+  the notification hasn't arrived yet.
+- **`bin/codebuddy-mcp-server.py`**: cached the log file handle in
+  `_log_line()`. The `_log_date` field already tracked date rollovers
+  but the handle was being re-opened on every call. Now `_log_fh`
+  stays open across calls; the handle is only closed + reopened on a
+  date change.
+- **`skills/codebuddy-integration/SKILL.md`**: rewritten to MVP — 4
+  tools, call shape, and 5 rules. Dropped the 0.2.1 → 0.3.0 history,
+  the "Why MCP over CLI" section, the nested ASCII decision tree,
+  and the prose "Quick diagnostics" / "Cross-session boundary"
+  sections. 89 → 35 lines. The plugin's source of truth is now a
+  quick-reference card, not a historical narrative.
+
+### Tests
+
+- `tests/test_mcp_wrapper_unit.py` `TestLogLine` setUp/tearDown now
+  resets `_log_fh` and `_log_date` so the cached-handle optimization
+  doesn't leak a stale file descriptor across test cases.
+
 ## [0.3.0] - 2026-08-18
 
 Spec-aligned refactor. 0.2.2 was a PoC bump that was never released

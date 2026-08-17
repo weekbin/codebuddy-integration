@@ -38,24 +38,39 @@ STATE_DIR.mkdir(parents=True, exist_ok=True)
 # ── structured logger ─────────────────────
 _log_lock = threading.Lock()
 _log_date: Optional[str] = None
+_log_fh = None  # cached file handle; reopened only on date change
 
 
 def _log_line(event: str, **fields) -> None:
-    global _log_date
+    global _log_date, _log_fh
     now = datetime.now(timezone.utc)
     date_str = now.strftime("%Y-%m-%d")
     ts = now.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-    path = STATE_DIR / f"mcp-{date_str}.log"
     parts = [ts, event] + [f"{k}={_fmt(v)}" for k, v in fields.items()]
     line = " | ".join(parts) + "\n"
     with _log_lock:
-        try:
-            with path.open("a", encoding="utf-8") as f:
-                f.write(line)
-        except Exception:
-            pass
-    if _log_date != date_str:
-        _log_date = date_str
+        if _log_date != date_str:
+            # Date rollover: close old handle, open new one.
+            try:
+                if _log_fh is not None:
+                    _log_fh.close()
+            except Exception:
+                pass
+            try:
+                # buffering=1 (line buffering) so each '\n'-terminated line
+                # is flushed to the OS immediately, while still reusing
+                # the file handle across calls to avoid per-call open().
+                _log_fh = (STATE_DIR / f"mcp-{date_str}.log").open(
+                    "a", encoding="utf-8", buffering=1,
+                )
+            except Exception:
+                _log_fh = None
+            _log_date = date_str
+        if _log_fh is not None:
+            try:
+                _log_fh.write(line)
+            except Exception:
+                pass
 
 
 def _fmt(v) -> str:
@@ -200,16 +215,6 @@ class ACPSession:
             self._notifications.clear()
         return notifs
 
-    def _drain_until_idle(self, max_polls=30, poll_interval=0.1):
-        last = -1
-        for _ in range(max_polls):
-            with self._notif_lock:
-                cur = len(self._notifications)
-            if cur == 0 and last == 0:
-                return
-            last = cur
-            time.sleep(poll_interval)
-
     def _initialize(self):
         self.call("initialize", {
             "protocolVersion": 1,
@@ -251,7 +256,6 @@ class ACPSession:
                 "prompt": [{"type": "text", "text": text}],
             }, timeout=timeout)
         duration = time.time() - t0
-        self._drain_until_idle()
         message = r.get("text") or r.get("message") or "" if isinstance(r, dict) else ""
         usage = None
         used_model = None

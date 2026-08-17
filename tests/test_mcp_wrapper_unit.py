@@ -23,10 +23,27 @@ class TestPluginRootPathlib(unittest.TestCase):
 
 class TestLogLine(unittest.TestCase):
     def setUp(self):
+        # Reset module-level cached log handle so each test writes to a fresh
+        # STATE_DIR rather than reusing a handle opened against a prior tmpdir.
+        try:
+            if _mod._log_fh is not None:
+                _mod._log_fh.close()
+        except Exception:
+            pass
+        _mod._log_fh = None
+        _mod._log_date = None
         self._orig_state_dir = _mod.STATE_DIR
         self.tmp_state = Path(tempfile.mkdtemp(prefix="mcp-test-"))
         _mod.STATE_DIR = self.tmp_state
     def tearDown(self):
+        # Close & null any handle this test may have left open, then restore.
+        try:
+            if _mod._log_fh is not None:
+                _mod._log_fh.close()
+        except Exception:
+            pass
+        _mod._log_fh = None
+        _mod._log_date = None
         _mod.STATE_DIR = self._orig_state_dir
     def test_writes_line_to_dated_file(self):
         _mod._log_line("test_event", foo=42, bar="hi")
