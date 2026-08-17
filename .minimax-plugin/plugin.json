@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "name": "codebuddy-integration",
+  "displayName": "Codebuddy Integration",
+  "version": "0.1.6",
+  "description": "Skill and CLI wrapper that lets MiniMax Code delegate a text-reasoning task to a separate codebuddy subagent (spends codebuddy credits, not mcode tokens). Useful for second opinions, translations, long-context summaries, and fresh implementation drafts.",
+  "author": "weekbin",
+  "category": "Code",
+  "exampleQueries": [
+    "用 codebuddy 帮我 review 这段 Python 的线程安全 LRU cache 设计",
+    "summarize this 50k-token spec with codebuddy in 5 bullets",
+    "ask codebuddy to translate this README to English"
+  ],
+  "apps": [],
+  "mcpServers": [],
+  "skills": [
+    "skills/codebuddy-integration/SKILL.md"
+  ]
+}

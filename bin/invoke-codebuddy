@@ -1,0 +1,478 @@
+#!/usr/bin/env bash
+# invoke-codebuddy - 把 codebuddy 封装成"subagent"调用
+#
+# 默认行为 (oneshot):
+#   1. 在当前 orca worktree 开一个 codebuddy terminal
+#   2. 发送任务
+#   3. 等回复
+#   4. 提取结果
+#   5. 关闭 terminal   <-- 用完即关
+#   6. 返回结果
+#
+# 用法:
+#   invoke-codebuddy "翻译成英文: 你好世界"
+#   invoke-codebuddy --json "用 Python 写一个二分查找"
+#   invoke-codebuddy --keep "写一份完整 README"            # 保留 terminal，可后续追问
+#   invoke-codebuddy --follow "继续追问"                    # 复用 --keep 的 terminal
+#   invoke-codebuddy --background "跑长任务"                # 异步，返回 handle + result-file
+#   invoke-codebuddy --await <handle>                      # 阻塞等结果（不烧 mcode token）
+#   invoke-codebuddy --result-file <handle>                # 只打印 result 文件路径
+#   invoke-codebuddy --status <handle>                     # 看后台任务最新输出
+#   invoke-codebuddy --kill <handle>                       # 关闭 terminal
+#   invoke-codebuddy --mode print "纯文本任务"              # 不走 TUI，用 codebuddy --print
+#   invoke-codebuddy --new-session                         # 强制新会话
+#   invoke-codebuddy --log                                 # 看本次最近调用记录
+set -eo pipefail
+
+# ── 路径固化 (相对脚本位置，不依赖调用方 cwd) ─────────────
+SCRIPT_PATH="$(readlink -f "$0")"
+SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"                 # <plugin-root>/bin
+SKILL_DIR="$(dirname "$SCRIPT_DIR")"                   # <plugin-root>
+HANDLE_FILE="${INVOKE_CODEBUDDY_HANDLE_FILE:-$SKILL_DIR/state/handle}"
+LOG_FILE="$SKILL_DIR/logs/invocations.log"
+STATE_DIR="$SKILL_DIR/state"
+mkdir -p "$STATE_DIR" "$(dirname "$LOG_FILE")" 2>/dev/null || true
+
+# ── 常量 ──────────────────────────────────────────────
+ORCA=orca-ide
+CB_BIN="${CODEBUDDY_BIN:-codebuddy}"
+TITLE="invoke-codebuddy"
+
+JSON_OUT=false
+KEEP=false
+FOLLOW=false
+BG_MODE=false
+NEW_SESSION=false
+MODE="acp"
+# Allow callers (e.g. smoke tests) to override the default wait timeout.
+TIMEOUT="${INVOKE_CODEBUDDY_TIMEOUT:-300}"
+LOG_THIS=true
+TASK=""
+CMD=""
+HANDLE=""
+
+usage() {
+  # Print only the leading # comment block, stopping at the first non-# line.
+  awk 'NR==1 {next} /^#/ {sub(/^# ?/,""); print; next} {exit}' "$SCRIPT_PATH"
+}
+
+# ── 解析参数 ─────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --json) JSON_OUT=true; shift ;;
+    --keep) KEEP=true; shift ;;
+    --follow) FOLLOW=true; shift ;;
+    --background|--bg) BG_MODE=true; shift ;;
+    --new-session) NEW_SESSION=true; shift ;;
+    --mode) MODE="$2"; shift 2 ;;
+    --timeout) TIMEOUT="$2"; shift 2 ;;
+    --no-log) LOG_THIS=false; shift ;;
+    --status) CMD=status; HANDLE="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
+    --kill)   CMD=kill;   HANDLE="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
+    --await)  CMD=await;  HANDLE="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
+    --result-file) CMD=result_file; HANDLE="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
+    --events)  CMD=events;  HANDLE="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
+    --metrics) CMD=metrics; HANDLE="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
+    --log) CMD=log; shift ;;
+    --help|-h) usage; exit 0 ;;
+    -*) echo "invoke-codebuddy: unknown flag: $1" >&2; exit 2 ;;
+    *)  TASK="$1"; shift ;;
+  esac
+done
+
+# ── 工具 ────────────────────────────────────────────
+ts() { date +%Y-%m-%dT%H:%M:%S%z; }
+log_invoke() {
+  $LOG_THIS || return 0
+  local mode="$1" keep="$2" handle="$3" outcome="$4" dur="$5" task="$6"
+  # task 截前 200 字符 + 转义
+  local safe_task=$(printf '%s' "$task" | head -c 200 | tr '\n' ' ' | tr -d '\r')
+  printf '%s\t%s\t%s\tkeep=%s\tdur=%ss\thandle=%s\toutcome=%s\ttask=%s\n' \
+    "$(ts)" "$$" "$mode" "$keep" "$dur" "$handle" "$outcome" "$safe_task" \
+    >> "$LOG_FILE"
+}
+get_stored_handle() { [ -f "$HANDLE_FILE" ] && cat "$HANDLE_FILE" 2>/dev/null || true; }
+is_handle_alive() {
+  local h="$1"
+  [ -z "$h" ] && return 1
+  $ORCA terminal list --worktree active --json 2>/dev/null \
+    | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    hs = [t['handle'] for t in d.get('result', {}).get('terminals', []) if not t.get('orphaned')]
+    sys.exit(0 if '$h' in hs else 1)
+except: sys.exit(1)
+" 2>/dev/null
+}
+create_terminal() {
+  # --dangerously-skip-permissions + --permission-mode bypassPermissions +
+  # --subagent-permission-mode bypassPermissions: same reason as in
+  # invoke-codebuddy-acp-worker.py — without the subagent flag,
+  # codebuddy's own teammates will hit `waiting_for_permission` and
+  # the TUI session will appear to hang on the user.
+  $ORCA terminal create --worktree active --title "$TITLE" \
+    --command "$CB_BIN --dangerously-skip-permissions --permission-mode bypassPermissions --subagent-permission-mode bypassPermissions" --json 2>/dev/null \
+    | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['terminal']['handle'])" \
+    || { echo "invoke-codebuddy: failed to create codebuddy terminal" >&2; exit 3; }
+}
+
+# ── 子命令 ─────────────────────────────────────────
+case "$CMD" in
+  status)
+    [ -z "$HANDLE" ] && HANDLE=$(get_stored_handle)
+    [ -z "$HANDLE" ] && { echo "invoke-codebuddy: no handle (use --status <handle> or ensure $HANDLE_FILE exists)" >&2; exit 2; }
+    $ORCA terminal read --terminal "$HANDLE" --json 2>/dev/null \
+      | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+t = d.get('result', {}).get('terminal', {})
+print('\n'.join(t.get('tail', [])))
+"
+    exit 0 ;;
+  kill)
+    if [ -z "$HANDLE" ] && [ -f "$HANDLE_FILE" ]; then
+      HANDLE=$(cat "$HANDLE_FILE" 2>/dev/null || true)
+    fi
+    [ -z "$HANDLE" ] && { echo "invoke-codebuddy: need handle (arg or $HANDLE_FILE)" >&2; exit 2; }
+    $ORCA terminal close --terminal "$HANDLE" --json >/dev/null 2>&1
+    if [ -f "$HANDLE_FILE" ] && grep -q "$HANDLE" "$HANDLE_FILE" 2>/dev/null; then
+      rm -f "$HANDLE_FILE"
+    fi
+    echo "closed: $HANDLE"
+    log_invoke "kill" "n/a" "$HANDLE" "closed" "0" "(kill)"
+    exit 0 ;;
+  log)
+    if [ -f "$LOG_FILE" ]; then
+      tail -n "${2:-20}" "$LOG_FILE"
+    else
+      echo "(no log file: $LOG_FILE)"
+    fi
+    exit 0 ;;
+  result_file)
+    [ -z "$HANDLE" ] && HANDLE=$(get_stored_handle)
+    [ -z "$HANDLE" ] && { echo "invoke-codebuddy: no handle" >&2; exit 2; }
+    echo "$STATE_DIR/result-$HANDLE.md"
+    exit 0 ;;
+  await)
+    [ -z "$HANDLE" ] && HANDLE=$(get_stored_handle)
+    [ -z "$HANDLE" ] && { echo "invoke-codebuddy: no handle" >&2; exit 2; }
+    local_result_file="$STATE_DIR/result-$HANDLE.md"
+    local_done_file="$STATE_DIR/done-$HANDLE"
+    # 优先 inotifywait (event-driven, 0 CPU)，fallback 到轮询
+    if command -v inotifywait >/dev/null 2>&1; then
+      inotifywait -qq -t "$TIMEOUT" -e create -e close_write "$STATE_DIR" 2>/dev/null || true
+    else
+      elapsed=0
+      while [ ! -f "$local_done_file" ] && [ "$elapsed" -lt "$TIMEOUT" ]; do
+        sleep 1; elapsed=$((elapsed+1))
+      done
+    fi
+    if [ -f "$local_result_file" ]; then
+      cat "$local_result_file"
+      exit 0
+    fi
+    echo "invoke-codebuddy: await timeout ($TIMEOUT s) for handle $HANDLE" >&2
+    exit 5
+    ;;
+  events)
+    [ -z "$HANDLE" ] && HANDLE=$(get_stored_handle)
+    [ -z "$HANDLE" ] && { echo "invoke-codebuddy: no handle" >&2; exit 2; }
+    local_events="$STATE_DIR/events-$HANDLE.jsonl"
+    if [ ! -f "$local_events" ]; then
+      echo "invoke-codebuddy: no events file (use --background first or wrong handle)" >&2
+      exit 2
+    fi
+    # 模式 1: cat 全部
+    # 模式 2: --events <handle> --tail N
+    cat "$local_events"
+    exit 0 ;;
+  metrics)
+    [ -z "$HANDLE" ] && HANDLE=$(get_stored_handle)
+    [ -z "$HANDLE" ] && { echo "invoke-codebuddy: no handle" >&2; exit 2; }
+    local_status="$STATE_DIR/status-$HANDLE.json"
+    if [ ! -f "$local_status" ]; then
+      echo "invoke-codebuddy: no status file" >&2; exit 2
+    fi
+    python3 -c "
+import json, sys
+d = json.load(open('$local_status'))
+h = sys.argv[1] if len(sys.argv) > 1 else '?'
+print('=== invoke-codebuddy metrics ===')
+print('  handle:         ' + str(h))
+print('  phase:          ' + str(d.get('phase')))
+print('  outcome:        ' + str(d.get('outcome')))
+print('  duration:       ' + str(d.get('duration_s')) + 's')
+print('  trace_id:       ' + str(d.get('trace_id')))
+u = d.get('usage', {})
+print('  tokens:         prompt=%s completion=%s reasoning=%s cache_hit=%s' % (u.get('prompt_tokens', 0), u.get('completion_tokens', 0), u.get('reasoning_tokens', 0), u.get('cache_read_tokens', 0)))
+c = d.get('context_window', {})
+print('  context:        used=%s/%s (%s%%)' % (c.get('used', 0), c.get('size', 0), c.get('used_pct', 0)))
+b = d.get('usage_by_category', {})
+if b:
+    print('  by_category:    ' + str(b))
+" "$HANDLE"
+    exit 0 ;;
+esac
+
+[ -z "$TASK" ] && { usage; exit 2; }
+
+# ── 校验 ORCA / codebuddy (仅 TUI 需要, print/acp 走各自的 runtime) ──
+# print 模式直接 subprocess, 不依赖 orca
+# acp 模式 worker 自带 codebuddy 子进程 fallback, 不需要 upfront check
+# 只 TUI 模式真正需要 orca + codebuddy 都在
+
+# ── print 模式: 简单 subprocess, 干净 JSON 输出 ─────────
+if [ "$MODE" = "print" ]; then
+  T0=$(date +%s)
+  OUT=$($CB_BIN --print --output-format json --dangerously-skip-permissions \
+        --no-session-persistence "$TASK" 2>/dev/null \
+        | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    if isinstance(data, list) and data: data = data[-1]
+    if isinstance(data, list) and data: data = data[-1]
+    res = data.get('result', '') if isinstance(data, dict) else ''
+    print(res)
+except Exception as e:
+    print(f'[parse error: {e}]', file=sys.stderr)
+    sys.exit(1)
+" 2>/dev/null) || OUT="(error: subprocess failed)"
+  T1=$(date +%s); DT=$((T1 - T0))
+  log_invoke "print" "$KEEP" "-" "ok" "$DT" "$TASK"
+
+  if [ "$JSON_OUT" = true ]; then
+    python3 -c "
+import json
+out = '''$OUT'''.replace(chr(92), chr(92)+chr(92)).replace(chr(34), chr(92)+chr(34)).replace(chr(10), chr(92)+'n')
+print(json.dumps({'ok': True, 'mode': 'print', 'duration_s': $DT, 'result': out}, ensure_ascii=False))
+"
+  else
+    echo "$OUT"
+  fi
+  exit 0
+fi
+
+# ── acp 同步模式: 直接跑 worker，wait done (仅在非 background 时跑) ───────────
+if [ "$MODE" = "acp" ] && [ "$BG_MODE" = false ]; then
+  HANDLE="acp-sync-$$-$(date +%s)"
+  RESULT_FILE="$STATE_DIR/result-$HANDLE.md"
+  DONE_FILE="$STATE_DIR/done-$HANDLE"
+  EVENTS_FILE="$STATE_DIR/events-$HANDLE.jsonl"
+  STATUS_FILE="$STATE_DIR/status-$HANDLE.json"
+  rm -f "$RESULT_FILE" "$DONE_FILE" "$EVENTS_FILE" "$STATUS_FILE"
+  T0=$(date +%s)
+  python3 "$SCRIPT_DIR/invoke-codebuddy-acp-worker.py" \
+    --task "$TASK" \
+    --events-file "$EVENTS_FILE" \
+    --status-file "$STATUS_FILE" \
+    --result-file "$RESULT_FILE" \
+    --done-file "$DONE_FILE" \
+    --timeout "$TIMEOUT" 2>/dev/null
+  RC=$?
+  T1=$(date +%s); DT=$((T1-T0))
+  log_invoke "acp-sync" "n/a" "$HANDLE" "rc=$RC" "$DT" "$TASK"
+  if [ -f "$RESULT_FILE" ]; then
+    OUT=$(cat "$RESULT_FILE")
+  else
+    OUT="(error: worker exit $RC, no result file)"
+  fi
+  if [ "$JSON_OUT" = true ]; then
+    python3 -c "
+import json
+out = open('$RESULT_FILE').read() if __import__('os').path.exists('$RESULT_FILE') else '(no result)'
+out = out.replace(chr(92), chr(92)+chr(92)).replace(chr(34), chr(92)+chr(34)).replace(chr(10), chr(92)+'n')
+status = json.load(open('$STATUS_FILE')) if __import__('os').path.exists('$STATUS_FILE') else {}
+print(json.dumps({'ok': $RC == 0, 'mode': 'acp', 'handle': '$HANDLE', 'duration_s': $DT,
+                  'rc': $RC, 'result': out, 'status': status}, ensure_ascii=False))
+"
+  else
+    echo "$OUT"
+    if [ -f "$STATUS_FILE" ]; then
+      echo
+      echo "--- 状态: invoke-codebuddy --metrics $HANDLE ---"
+    fi
+  fi
+  exit $RC
+fi
+
+# ── TUI 模式: 通过 orca-ide terminal ─────────────────
+# 依赖检查: TUI 模式才需要 orca + codebuddy 都在
+command -v "$ORCA" >/dev/null 2>&1 || { echo "invoke-codebuddy: '$ORCA' not in PATH" >&2; exit 4; }
+command -v "$CB_BIN" >/dev/null 2>&1 || { echo "invoke-codebuddy: '$CB_BIN' not in PATH" >&2; exit 4; }
+
+# 决定用哪个 handle
+if [ "$FOLLOW" = true ] && [ "$NEW_SESSION" = false ]; then
+  HANDLE=$(get_stored_handle)
+  if [ -n "$HANDLE" ] && ! is_handle_alive "$HANDLE"; then
+    HANDLE=""
+  fi
+  [ -n "$HANDLE" ] && KEEP=true   # --follow 隐式 keep
+fi
+
+if [ "$MODE" = "tui" ] && { [ -z "$HANDLE" ] || [ "$NEW_SESSION" = true ]; }; then
+  # --new-session 时把旧的 (自己 HANDLE_FILE 里的) 关掉
+  if [ "$NEW_SESSION" = true ]; then
+    OLD=$(get_stored_handle)
+    if [ -n "$OLD" ] && is_handle_alive "$OLD"; then
+      $ORCA terminal close --terminal "$OLD" --json >/dev/null 2>&1 || true
+    fi
+    rm -f "$HANDLE_FILE"
+  fi
+  HANDLE=$(create_terminal)
+  $ORCA terminal wait --terminal "$HANDLE" --for tui-idle --timeout-ms 30000 --json >/dev/null 2>&1 || true
+  echo "$HANDLE" > "$HANDLE_FILE"
+fi
+[ "$KEEP" = true ] && [ -n "$HANDLE" ] && echo "$HANDLE" > "$HANDLE_FILE"
+
+# 发任务 (只 TUI 走 orca terminal; acp-bg 自己开 worker, 不需要 TUI)
+[ "$MODE" = "tui" ] && $ORCA terminal send --terminal "$HANDLE" --text "$TASK" --enter --json >/dev/null
+
+# 异步 acp 模式: 启动 Python worker (acp 客户端，更丰富的状态)
+if [ "$MODE" = "acp" ] && [ "$BG_MODE" = true ]; then
+  if [ "$KEEP" = true ]; then echo "$HANDLE" > "$HANDLE_FILE"; fi
+  HANDLE="acp-$$-$(date +%s)"
+  RESULT_FILE="$STATE_DIR/result-$HANDLE.md"
+  DONE_FILE="$STATE_DIR/done-$HANDLE"
+  EVENTS_FILE="$STATE_DIR/events-$HANDLE.jsonl"
+  STATUS_FILE="$STATE_DIR/status-$HANDLE.json"
+  rm -f "$RESULT_FILE" "$DONE_FILE" "$EVENTS_FILE" "$STATUS_FILE"
+  # 用 systemd-run --user --unit=NAME: 创建真正独立的 service unit
+  # (不能加 --scope, 因为 --scope 绑到父进程生命周期, 父退出就死)
+  # 这种 transient unit 在完成后会自动清理
+  UNIT="invoke-codebuddy-acp-$$-$(date +%s)"
+  if ! systemd-run --user --unit="$UNIT" \
+    python3 "$SCRIPT_DIR/invoke-codebuddy-acp-worker.py" \
+      --task "$TASK" \
+      --events-file "$EVENTS_FILE" \
+      --status-file "$STATUS_FILE" \
+      --result-file "$RESULT_FILE" \
+      --done-file "$DONE_FILE" \
+      --timeout "$TIMEOUT" </dev/null >/dev/null 2>&1; then
+    # fallback: setsid + 双 fork
+    ( setsid python3 "$SCRIPT_DIR/invoke-codebuddy-acp-worker.py" \
+        --task "$TASK" \
+        --events-file "$EVENTS_FILE" \
+        --status-file "$STATUS_FILE" \
+        --result-file "$RESULT_FILE" \
+        --done-file "$DONE_FILE" \
+        --timeout "$TIMEOUT" </dev/null >/dev/null 2>&1 & ) &
+    disown 2>/dev/null || true
+  fi
+  log_invoke "acp-bg" "$KEEP" "$HANDLE" "spawned" "0" "$TASK"
+  if [ "$JSON_OUT" = true ]; then
+    printf '{"ok":true,"mode":"acp","background":true,"handle":"%s","events_file":"%s","status_file":"%s","result_file":"%s","await_cmd":"invoke-codebuddy --await %s","metrics_cmd":"invoke-codebuddy --metrics %s"}
+' \
+      "$HANDLE" "$EVENTS_FILE" "$STATUS_FILE" "$RESULT_FILE" "$HANDLE" "$HANDLE"
+  else
+    printf 'background handle: %s\nevents file:    %s\nstatus file:    %s\nresult file:    %s\nawait:          invoke-codebuddy --await %s\nmetrics:        invoke-codebuddy --metrics %s\n' \
+      "$HANDLE" "$EVENTS_FILE" "$STATUS_FILE" "$RESULT_FILE" "$HANDLE" "$HANDLE"
+  fi
+  exit 0
+fi
+
+# 异步模式: 启动 + spawn detached watcher (写 result file + done marker)
+if [ "$BG_MODE" = true ]; then
+  if [ "$KEEP" = true ]; then echo "$HANDLE" > "$HANDLE_FILE"; fi
+  RESULT_FILE="$STATE_DIR/result-$HANDLE.md"
+  DONE_FILE="$STATE_DIR/done-$HANDLE"
+  rm -f "$RESULT_FILE" "$DONE_FILE"
+
+  # spawn watcher - detached, parent 不需要等
+  nohup bash -c "
+    WAIT_RC=0
+    $ORCA terminal wait --terminal '$HANDLE' --for tui-idle --timeout-ms $(($TIMEOUT * 1000)) >/dev/null 2>&1 || WAIT_RC=\$?
+    T0=\$(date +%s)
+    # 提取 result
+    $ORCA terminal read --terminal '$HANDLE' --json 2>/dev/null \
+      | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+tail = d.get(\"result\", {}).get(\"terminal\", {}).get(\"tail\", []) or []
+result = []
+capturing = False
+for line in tail:
+    s = line.rstrip()
+    if s.startswith(\"●\"):
+        if result: break
+        result.append(s.lstrip(\"● \").strip())
+        capturing = True
+    elif capturing:
+        if not s or s.startswith(\"─\") or s.startswith(\"> \"):
+            break
+        result.append(s)
+print(\"\\n\".join(result).strip() or \"(无可见回复 - 可能是长答案被 TUI 折叠)\")
+' > '$RESULT_FILE' 2>&1
+    T1=\$(date +%s)
+    touch '$DONE_FILE'
+    printf '%s\twatcher\ttui-bg-bg\tdur=%ss\thandle=$HANDLE\toutcome=rc%s\ttask=%s\n' \
+      \"\$(date '+%Y-%m-%dT%H:%M:%S%z')\" \"\$((T1-T0))\" \"\$WAIT_RC\" \"$TASK\" \
+      >> '$LOG_FILE'
+  " >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+
+  log_invoke "tui-bg" "$KEEP" "$HANDLE" "spawned" "0" "$TASK"
+  if [ "$JSON_OUT" = true ]; then
+    printf '{"ok":true,"mode":"tui","background":true,"handle":"%s","result_file":"%s","await_cmd":"invoke-codebuddy --await %s"}\n' \
+      "$HANDLE" "$RESULT_FILE" "$HANDLE"
+  else
+    printf 'background handle: %s\nresult file:     %s\nawait:           invoke-codebuddy --await %s\n' \
+      "$HANDLE" "$RESULT_FILE" "$HANDLE"
+  fi
+  exit 0
+fi
+
+# 等回复
+T0=$(date +%s)
+WAIT_RC=0
+$ORCA terminal wait --terminal "$HANDLE" --for tui-idle --timeout-ms $((TIMEOUT * 1000)) --json >/dev/null 2>&1 || WAIT_RC=$?
+T1=$(date +%s); DT=$((T1 - T0))
+
+# 提取回复
+RESULT=$($ORCA terminal read --terminal "$HANDLE" --json 2>/dev/null \
+  | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+tail = d.get('result', {}).get('terminal', {}).get('tail', []) or []
+result = []
+capturing = False
+for line in tail:
+    s = line.rstrip()
+    if s.startswith('●'):
+        if result: break
+        result.append(s.lstrip('● ').strip())
+        capturing = True
+    elif capturing:
+        if not s or s.startswith('─') or s.startswith('> '):
+            break
+        result.append(s)
+print('\n'.join(result).strip() or '(无可见回复 - 可能是长答案被 TUI 折叠)')
+")
+
+# 默认 oneshot 关闭 - 只关自己 HANDLE_FILE 里的 handle
+if [ "$KEEP" = false ]; then
+  if [ -f "$HANDLE_FILE" ] && grep -q "$HANDLE" "$HANDLE_FILE" 2>/dev/null; then
+    $ORCA terminal close --terminal "$HANDLE" --json >/dev/null 2>&1 || true
+    rm -f "$HANDLE_FILE"
+  fi
+fi
+
+OUTCOME="ok"
+[ "$WAIT_RC" -ne 0 ] && OUTCOME="wait_timeout"
+log_invoke "tui" "$KEEP" "$HANDLE" "$OUTCOME" "$DT" "$TASK"
+
+# 输出
+if [ "$JSON_OUT" = true ]; then
+  python3 -c "
+import json
+out = '''$RESULT'''.replace(chr(92), chr(92)+chr(92)).replace(chr(34), chr(92)+chr(34)).replace(chr(10), chr(92)+'n')
+print(json.dumps({
+    'ok': True, 'mode': 'tui', 'handle': '$HANDLE',
+    'kept': $([ "$KEEP" = true ] && echo True || echo False),
+    'wait_rc': $WAIT_RC, 'duration_s': $DT, 'result': out
+}, ensure_ascii=False))
+"
+else
+  echo "$RESULT"
+fi

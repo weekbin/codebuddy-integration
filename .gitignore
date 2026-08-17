@@ -1,0 +1,17 @@
+# Runtime state (regenerated on every plugin invocation)
+state/
+logs/
+
+# Build / cache artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/

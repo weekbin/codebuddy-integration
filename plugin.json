@@ -1,0 +1,20 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "codebuddy-integration",
+  "version": "0.1.6",
+  "description": "Skill and CLI wrapper that lets MiniMax Code delegate a text-reasoning task to a separate codebuddy subagent (spends codebuddy credits, not mcode tokens). Useful for second opinions, translations, long-context summaries, and fresh implementation drafts.",
+  "author": {
+    "name": "weekbin",
+    "url": "https://github.com/weekbin"
+  },
+  "license": "MIT",
+  "keywords": [
+    "minimax-code",
+    "plugin",
+    "codebuddy",
+    "subagent",
+    "second-opinion",
+    "translation",
+    "summarization"
+  ]
+}
