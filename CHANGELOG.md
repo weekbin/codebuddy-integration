@@ -6,6 +6,70 @@ All notable changes to this plugin are documented in this file. The format is ba
 
 ## [0.2.1] - 2026-08-17
 
+Two parallel fixes were landed on 0.2.1 — pre-check/model_warning/cache
+doc and the root-cause async-path rewrite — and merged here.
+
+### Changed (root-cause rewrite of the "async" path)
+
+The 0.2.0 plugin shipped a `--background` flag on `bin/invoke-codebuddy` that
+tried to daemonize the codebuddy worker via `systemd-run` (Linux) or
+`setsid` (macOS). This was unreliable in mcode's non-interactive `bash`
+tool — on macOS the worker was killed when the bash session exited, so
+`--await` blocked for the full 300s timeout and returned "no result".
+
+The root cause was that **agent scheduling is not a script's job** —
+mcode's `task` tool with `run_in_background=true` already does this, with
+a `<background-task-finished>` system reminder that wakes the agent on
+completion. The script's `--background` path was reinventing that
+wheel, badly.
+
+This release replaces the script-side background machinery with the
+**proper `task` + `bridge.sh` pattern**. Concretely:
+
+- **Removed** `--background` / `--bg` / `--await` / `--result-file`
+  flags and the corresponding `systemd-run` / `setsid` /
+  `disown` / `nohup` fallback in `bin/invoke-codebuddy`. The
+  `--background` flag now errors with `unknown flag`, locking in
+  the dead-code removal.
+- **`bin/invoke-codebuddy-bridge.sh`** is now a thin sync wrapper
+  (`exec invoke-codebuddy --json "$@"`), intended to be called by a
+  worker LLM that was spawned via mcode's `task(run_in_background=true)`.
+  The bridge is sync — it does one `--json` call and prints the reply
+  on stdout for the worker to copy into its final answer.
+- **SKILL.md "Choose the right execution path"** (new section, replaces
+  the obsolete "Subagent integration — REAL behavior, not wishful"
+  section): a decision flow that picks `--mode tui` only when
+  `command -v orca-ide` succeeds AND the agent is in an orca worktree
+  AND codebuddy needs to read/write files there. Otherwise, default to
+  `task(run_in_background=true) + invoke-codebuddy-bridge.sh`.
+- **SKILL.md "Permission pre-emption"** (new section): documents that
+  `codebuddy --acp` with `--dangerously-skip-permissions` +
+  `--permission-mode bypassPermissions` +
+  `--subagent-permission-mode bypassPermissions` does NOT pause for
+  permission prompts in practice. Live-verified 2026-08-17: a 7-second
+  end-to-end call that writes a real file in `/tmp` completed without
+  any interactive prompt. The "mcp-bridge + session-tick" fallback for
+  genuine question/answer is documented as a future option but
+  **explicitly NOT implemented** until a real case is observed.
+
+### Fixed (cross-platform)
+
+- `bin/invoke-codebuddy` and `bin/install.sh` used `readlink -f "$0"`
+  to resolve the script's real path. **macOS BSD `readlink` does not
+  support `-f`**, so the script crashed on macOS for any user whose
+  `~/bin/invoke-codebuddy` is a symlink. Replaced with a
+  `python3 -c "import os, sys; print(os.path.realpath(sys.argv[1]))"`
+  helper (cross-platform, no `coreutils` dep).
+- `bin/invoke-codebuddy-acp-worker.py` used PEP 604 union syntax
+  (`dict | None`, `str | None`) in type hints. **Python 3.9 does not
+  support it** (still ships as `/usr/bin/python3` on macOS). Replaced
+  with `Optional[...]` for portability.
+- `bin/invoke-codebuddy-acp-worker.py` hard-coded `"codebuddy"` as the
+  first arg of `subprocess.Popen`, so a user with a non-PATH install
+  (e.g. nvm v24 on macOS where the default shell is v22) got
+  `FileNotFoundError` even after `export CODEBUDDY_BIN=...`. Now
+  reads `os.environ.get("CODEBUDDY_BIN")` like the bash script does.
+
 ### Fixed (from full-smoke.sh gap report on 0.2.0)
 
 - **Pre-check `--system-prompt-file` existence** — was: codebuddy silently
@@ -28,6 +92,20 @@ All notable changes to this plugin are documented in this file. The format is ba
   model_warning (and any other future stderr). Now sync-mode stderr reaches
   the user.
 
+### Added (cross-platform install)
+
+- `bin/install.sh`:
+  - **Auto-writes `~/.config/invoke-codebuddy/env`** with
+    `export CODEBUDDY_BIN=<detected path>`. Cross-platform probe
+    (`~/.nvm`, `~/.asdf`, `~/.volta`, `~/.local`, `/opt/homebrew/bin`,
+    `/usr/local/bin`, `/usr/bin`). The main script sources this env
+    file on startup, so users no longer need to remember
+    `export CODEBUDDY_BIN=...` every shell.
+  - **Auto-appends a `PATH` block** to `~/.zshrc` and `~/.bashrc` (with
+    a marker line so re-runs are idempotent) so new shells find
+    `invoke-codebuddy` without manual `export PATH=...`.
+  - **Cross-platform readlink** (see Fixed above).
+
 ### Documented (gap report correction)
 
 - **Cache hit rate is unstable and server-driven** — previous README claimed
@@ -37,11 +115,31 @@ All notable changes to this plugin are documented in this file. The format is ba
   not 1×. README and SKILL.md updated to reflect actual behavior. Use
   `--metrics <handle>` to see your own hit rate.
 
-### Added
+### Tests
 
-- `tests/full-smoke.sh` — long-task + cache + system-prompt + error
-  + state + bridge + install-sh smoke tests, 28 cases. Requires a real
-  `codebuddy` login (burns ~150-200k tokens, mostly cache hits).
+- `tests/smoke.sh` rewritten to be a **real** end-to-end test, not a
+  mock. The previous version mocked `codebuddy` at the bash level;
+  passing it proved nothing about the real codebuddy runtime. The
+  new version:
+  - Detects a real `codebuddy` CLI on the test machine.
+  - Runs **REAL** `--mode print`, **REAL** acp-mode with
+    `system_prompt_mode=base-only`, **REAL** permission-pre-emption
+    (asks codebuddy to write a file and verifies it was written
+    without any interactive prompt), **REAL** `--metrics`, **REAL**
+    `bridge.sh` end-to-end. If no real codebuddy is found, those tests
+    SKIP (not pass-with-mock) so a CI box without codebuddy can still
+    run the script-only logical tests.
+  - Keeps the **logical** tests (`--help`, `--bogus-flag`, "no
+    codebuddy" friendly diagnostic, plugin-root resolution under
+    symlink, `bridge.sh` no-args usage) which do not require a real
+    codebuddy.
+  - Final result: **40 passed, 0 failed, 0 skipped** with a real
+    codebuddy on disk; logical-only subset still runs to completion
+    on a host without codebuddy.
+- `tests/full-smoke.sh` (in the user's pre-merge 0.2.1) — long-task +
+  cache + system-prompt + error + state + bridge + install-sh smoke
+  tests, 28 cases. Requires a real `codebuddy` login (burns ~150-200k
+  tokens, mostly cache hits).
 
 ## [0.2.0] - 2026-08-17
 

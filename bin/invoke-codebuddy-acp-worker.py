@@ -36,6 +36,7 @@ import sys
 import time
 import threading
 from pathlib import Path
+from typing import Optional
 
 # ── I/O helpers ─────────────────────────────────────────
 def append_event(events_file: Path, ev: dict) -> None:
@@ -98,7 +99,7 @@ class ACPClient:
         self.p.stdin.flush()
         return my_id
 
-    def _wait_id(self, want_id: int, timeout: float = 60) -> dict | None:
+    def _wait_id(self, want_id: int, timeout: float = 60) -> Optional[dict]:
         """Block until a JSON-RPC message with this id appears. Polls at 20ms."""
         end = time.time() + timeout
         while time.time() < end:
@@ -257,15 +258,18 @@ class Worker(ACPClient):
         write_status(self.status_file, self.status)
 
 # ── Main flow ─────────────────────────────────────────
-def run(task: str, model: str | None, events_file: Path, status_file: Path,
+def run(task: str, model: Optional[str], events_file: Path, status_file: Path,
         result_file: Path, done_file: Path, timeout: int,
-        system_prompt: str | None = None,
-        system_prompt_file: str | None = None,
-        append_system_prompt: str | None = None,
-        mcode_base_prompt_file: str | None = None) -> int:
-    # Spawn codebuddy --acp
+        system_prompt: Optional[str] = None,
+        system_prompt_file: Optional[str] = None,
+        append_system_prompt: Optional[str] = None,
+        mcode_base_prompt_file: Optional[str] = None) -> int:
+    # Spawn codebuddy --acp.  Honor CODEBUDDY_BIN so users with a non-PATH
+    # install (e.g. nvm v24 on macOS where the default shell is v22) can
+    # point at the real binary without exporting at every call.
+    cb_bin = os.environ.get("CODEBUDDY_BIN") or "codebuddy"
     cb_args = [
-        "codebuddy", "--acp",
+        cb_bin, "--acp",
         # --dangerously-skip-permissions: main session's tool permission gate
         # --permission-mode bypassPermissions: same as -y, but explicit
         # --subagent-permission-mode bypassPermissions: CRITICAL —

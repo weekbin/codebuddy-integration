@@ -54,10 +54,12 @@ This is a **Skill-only Plugin** containing one Skill plus a CLI binary:
   ACP mode to stream every event to disk (events JSONL, status JSON, result file,
   done marker). Knows how to read the mcode base system prompt and inject it via
   `--append-system-prompt` (per the "base + 业务" strategy below).
-- `bin/invoke-codebuddy-bridge.sh` — a one-line wrapper that does
-  `--background` + `--await` for the mavis worker's bash tool, so the worker
-  prompt can be one line and the worker's LLM usage is near zero. See
-  "Subagent integration" in `skills/codebuddy-integration/SKILL.md`.
+- `bin/invoke-codebuddy-bridge.sh` — a one-line sync wrapper for the mavis
+  worker's bash tool. The worker calls it once, gets codebuddy's reply on
+  stdout, copies that into its final answer. Worker LLM usage is near zero.
+  Combined with `task(run_in_background=true)` and mcode's
+  `<background-task-finished>` wake-up, this is the canonical "fire-and-
+  forget" path — see "Async pattern" in `skills/codebuddy-integration/SKILL.md`.
 - `bin/install.sh` — first-time setup. Writes `$HOME/.config/invoke-codebuddy/install-path`
   and `ln -sfn` the script to `~/bin/invoke-codebuddy`. Re-run after editing the
   plugin in place.
@@ -70,7 +72,8 @@ This is a **Skill-only Plugin** containing one Skill plus a CLI binary:
 The plugin never carries `codebuddy` credentials, never opens network sockets of
 its own, and never spawns anything that mcode's own tools could not have spawned
 themselves. The only new behavior is **policy** ("when to delegate") and **ergonomics**
-(oneshot / keep / follow / background / await / metrics all in one command).
+(oneshot / keep / follow / metrics / events in one command, plus a sync bridge for
+`task(run_in_background=true)` workflows).
 
 ## Setup (one-time)
 
@@ -130,17 +133,15 @@ installed.**
   instead of symlinking. The error message printed on a missing CLI lists the
   three common fix paths.
 - `python3` on `$PATH` (used by the ACP worker and by JSON parsing helpers).
-- `systemd-run --user` for the ACP background mode (Linux only); the script
-  transparently falls back to `setsid` on systems without systemd (incl. macOS).
+- The plugin does **not** need `systemd-run` or `setsid`; background work
+  belongs to mcode's `task` tool with `run_in_background=true`, and the
+  worker calls `invoke-codebuddy-bridge.sh` (sync). This works identically
+  on macOS and Linux (no platform-specific daemonization).
 - (`--mode tui` only) `orca-ide` on `$PATH` and a running orca worktree context.
   **If you pass `--mode tui` and `orca-ide` is not installed, the script falls
   back to `--mode print` automatically and prints a warning to stderr — so
   plugin-level failure is never caused by a missing `orca-ide`.**
-- (Optional, recommended) `inotifywait` for zero-CPU `--await` waits. Without it
-  the script polls every 1 s, which is still fine for tasks ≥ 5 s.
-- (TUI mode) `jq` is **not** required for TUI. (ACP / subagent worker only) `jq`
-  is required because `bin/invoke-codebuddy-bridge.sh` uses `jq -r .handle` to
-  extract the handle from the `--json --background` output.
+- `jq` is **not** required.
 
 > **`~/.codebuddy/bin/` is the CodeBuddy CN.app (GUI) install dir on macOS,
 > not the codebuddy CLI.** The CLI is an npm package
@@ -158,12 +159,11 @@ invoke-codebuddy "translate to English: 你好世界"
 # structured JSON
 invoke-codebuddy --json "用 5 个字说 hi"
 
-# fire-and-forget long task, then await (no mcode LLM tokens burned)
-HANDLE=$(invoke-codebuddy --background "用 Python 写一个 LRU cache")
-sleep 30
-invoke-codebuddy --await "$HANDLE"
+# long task: use mcode `task` tool with run_in_background=true;
+# the worker calls invoke-codebuddy-bridge.sh (sync) and returns the reply.
+# mcode wakes you via <background-task-finished>. See SKILL.md "Async pattern".
 
-# inspect token usage after a background task finishes
+# inspect token usage after a sync call
 invoke-codebuddy --metrics "$HANDLE"
 
 # pick a model (default: let codebuddy server choose)
@@ -229,9 +229,6 @@ Use `--mode acp` (the default) when you want the base.
 - The plugin is designed for a single-user, single-worktree flow. Sharing
   `state/handle` across multiple concurrent mcode sessions on the same
   worktree is not safe.
-- ACP background mode depends on `systemd-run --user` (Linux) or `setsid` as
-  fallback. On platforms where neither is available, `--background` may not
-  survive the bash tool's session cleanup.
 
 ## Manual test evidence
 

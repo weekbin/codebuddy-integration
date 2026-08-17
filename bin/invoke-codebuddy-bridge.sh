@@ -1,51 +1,57 @@
 #!/usr/bin/env bash
-# invoke-codebuddy-bridge.sh - fire-and-await wrapper for codebuddy subagent calls.
+# invoke-codebuddy-bridge.sh - sync wrapper for codebuddy subagent calls.
 #
 # USAGE
-#   invoke-codebuddy-bridge.sh "<task prompt>"
+#   invoke-codebuddy-bridge.sh "<task prompt>" [extra invoke-codebuddy flags...]
 #
 # WHAT IT DOES
-#   1. invoke-codebuddy --background <prompt>  -> spawn codebuddy, return HANDLE
-#   2. invoke-codebuddy --await      <HANDLE>  -> inotifywait on state/done-<handle>
-#                                              (0 CPU; falls back to 1s poll)
-#   3. cat the result file to stdout
+#   单一调用:`invoke-codebuddy --json "$@"` (默认 acp 同步模式,~6s,带完整 status)
+#   把 codebuddy 的 reply 打到 stdout,worker 把它原样 copy 到自己的 final answer。
 #
 # WHY IT EXISTS
-#   Designed for the mavis worker's bash tool. The worker only has to call this
-#   one command and copy stdout back as its final answer. No need for the worker
-#   to reason about --background / --await / HANDLE_FILE / inotifywait — that
-#   is all already implemented in `invoke-codebuddy`. The bridge is just the
-#   two-line sequence collapsed into one command so the worker prompt can be
-#   one line and the LLM cost is near zero.
+#   用来给 mcode 的 `task` 工具 + `run_in_background=true` 派出的 worker 用:
+#   - worker 跑这个 bridge,bridge 内部用 sync 模式等结果(5-30s)
+#   - mcode 用 `<background-task-finished>` wake-up,worker 一回话 mcode 拿到结果
+#   - 跟 mcode session 共生命周期,不会像 systemd-run/setsid 那样在 bash 退出时被杀
 #
-# EXIT CODES
-#   0  codebuddy returned a result (success or business-level error inside result)
-#   2  bad arguments (no prompt)
-#   any non-zero from invoke-codebuddy (e.g. codebuddy binary missing, timeout)
+#   注意:这个 bridge 是"fire-and-collect on a worker",不是"fire-and-forget on
+#   mcode 自己的 bash tool" — 后者已经由 mcode task 工具 + run_in_background 解决。
+#   脚本不提供 --background 路径(参见 SKILL.md "Async pattern" 章节)。
+#
+# EXIT CODES (同 invoke-codebuddy)
+#   0  codebuddy 返回了 reply
+#   2  bad arguments
+#   3  orca-ide 不可用且 mode=tui
+#   4  codebuddy CLI 找不到
+#   5  acp prompt timeout
+#   6  codebuddy 报告 error
 set -eo pipefail
 
-PROMPT="${1:-}"
-[ -z "$PROMPT" ] && {
+if [ $# -lt 1 ]; then
   cat >&2 <<'EOF'
-usage: invoke-codebuddy-bridge.sh "<task prompt>"
+usage: invoke-codebuddy-bridge.sh "<task prompt>" [extra invoke-codebuddy flags...]
 
 Examples:
   invoke-codebuddy-bridge.sh "translate to English: 你好世界"
   invoke-codebuddy-bridge.sh "summarize this spec: $(cat spec.md)"
   invoke-codebuddy-bridge.sh "review this Python LRU cache for race conditions"
+  invoke-codebuddy-bridge.sh --mode print "short reply"   # 5s no orca-ide
+  invoke-codebuddy-bridge.sh --model glm-5.2 "review ..." # 指定 model
 
-Side effects: spawns one orca/codebuddy terminal, appends one line to
-<plugin-root>/logs/invocations.log, leaves state/result-<handle>.md and
-state/done-<handle> behind. Pass --no-log to the underlying invoke-codebuddy
-to skip the log line.
+The bridge runs invoke-codebuddy once (sync, JSON output) and prints the
+codebuddy reply on stdout. It appends one line to
+<plugin-root>/logs/invocations.log. Pass --no-log to the underlying
+invoke-codebuddy to skip the log line.
 EOF
   exit 2
-}
+fi
 
 # Resolve sibling invoke-codebuddy: <plugin-root>/bin/invoke-codebuddy
 # Falls back to $PATH for users who symlink the bridge instead of placing
 # it next to invoke-codebuddy.
-SELF="$(readlink -f "$0")"
+# 跨平台:macOS BSD readlink 不支持 -f,用 python3。
+_self_realpath() { python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$1"; }
+SELF="$(_self_realpath "$0")"
 SELF_DIR="$(dirname "$SELF")"
 INVOKE="$SELF_DIR/invoke-codebuddy"
 if [ ! -x "$INVOKE" ]; then
@@ -56,16 +62,7 @@ command -v "$INVOKE" >/dev/null 2>&1 || {
   exit 4
 }
 
-# Spawn codebuddy, then await its completion. exec replaces this shell with
-# the await process so its exit code (and signal handling) propagate cleanly.
-# Use --json + jq to robustly extract the handle: --background prints a
-# multi-line block (handle + events/status/result paths + await/metrics
-# hints) in human mode, and a single JSON object with a `handle` field in
-# --json mode. The previous `HANDLE=$(...)` capture silently took the
-# entire multi-line block, which then crashed --await with "no such handle".
-if ! command -v jq >/dev/null 2>&1; then
-  echo "invoke-codebuddy-bridge.sh: 'jq' is required (not in PATH)" >&2
-  exit 4
-fi
-HANDLE=$("$INVOKE" --json --background "$PROMPT" | jq -r .handle) || exit $?
-exec "$INVOKE" --await "$HANDLE"
+# 单一 sync 调用。bridge 不需要 --json,但传 --json 让 stdout 更稳(避免 stdout
+# 同时含 events 调试行时解析混乱); worker 复制 stdout 的最后一段(就是 result)
+# 到自己的 final answer。
+exec "$INVOKE" --json "$@"

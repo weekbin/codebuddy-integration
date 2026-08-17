@@ -15,26 +15,40 @@
 #   invoke-codebuddy --json "用 Python 写一个二分查找"     # 结构化 JSON 输出
 #   invoke-codebuddy --keep "写一份完整 README"             # 保留 terminal，可后续追问
 #   invoke-codebuddy --follow "继续追问"                    # 复用 --keep 的 terminal
-#   invoke-codebuddy --background "跑长任务"                # 异步，返回 handle + result-file
-#   invoke-codebuddy --await <handle>                      # 阻塞等结果（不烧 mcode token）
-#   invoke-codebuddy --result-file <handle>                # 只打印 result 文件路径
-#   invoke-codebuddy --status <handle>                     # 看后台任务最新输出
-#   invoke-codebuddy --kill <handle>                       # 关闭 terminal
+#   invoke-codebuddy --status <handle>                     # 看 TUI terminal 当前 tail
+#   invoke-codebuddy --metrics <handle>                    # 看 acp status (phase / tokens / trace_id)
+#   invoke-codebuddy --events <handle>                     # 看 acp 事件流 (JSONL, phase / thought / message / usage)
+#   invoke-codebuddy --kill <handle>                       # 关闭 TUI terminal
+#   invoke-codebuddy --log                                 # 看本次最近调用记录
 #   invoke-codebuddy --mode print "纯文本任务"              # 不走 TUI，用 codebuddy --print
 #   invoke-codebuddy --new-session                         # 强制新会话
-#   invoke-codebuddy --log                                 # 看本次最近调用记录
 #   invoke-codebuddy --model glm-5.2 "..."                 # 指定 model (默认让 codebuddy server 自选)
 #   invoke-codebuddy --append-system-prompt "rule" "..."    # 业务 system prompt 拼在 plugin base 之后
 #   invoke-codebuddy --system-prompt-file <file> "..."      # 完全替换 plugin base system prompt
+#
+# 长任务(>30s)推荐用 mcode `task(run_in_background=true)` 派 worker 调
+# invoke-codebuddy-bridge.sh，wake-up 由 <background-task-finished> 系统提醒处理。
+# 脚本不提供 --background 路径(参见 SKILL.md "Async pattern" 章节)。
 set -eo pipefail
 
 # ── 路径解析: 三级回退,确保 state/ 和 logs/ 永远写在"被 mcode 安装的 plugin 目录"里 ─
 #   1. CODEBUDDY_PLUGIN_DIR env (mcode 安装时可注入)
 #   2. $HOME/.config/invoke-codebuddy/install-path (install.sh 写入)
 #   3. readlink 解析当前脚本位置 (向后兼容旧调用)
+#  注: macOS BSD readlink 不支持 -f,用 python3 实现跨平台。
 INSTALL_PATH_FILE="${INVOKE_CODEBUDDY_INSTALL_PATH:-$HOME/.config/invoke-codebuddy/install-path}"
-SCRIPT_PATH="$(readlink -f "$0")"
+_realpath() { python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$1"; }
+SCRIPT_PATH="$(_realpath "$0")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
+
+# Source install.sh 写的 env 文件(设 CODEBUDDY_BIN 等),让用户不需要每次 export。
+# 跨平台:env 文件路径固定,内容是 `export KEY=VALUE` 格式。环境变量已设则不覆盖。
+if [ -f "$HOME/.config/invoke-codebuddy/env" ]; then
+  set +e
+  # shellcheck disable=SC1091
+  . "$HOME/.config/invoke-codebuddy/env" 2>/dev/null
+  set -e
+fi
 if [ -n "${CODEBUDDY_PLUGIN_DIR:-}" ] && [ -d "$CODEBUDDY_PLUGIN_DIR" ]; then
   SKILL_DIR="$CODEBUDDY_PLUGIN_DIR"
 elif [ -f "$INSTALL_PATH_FILE" ] && [ -d "$(cat "$INSTALL_PATH_FILE" 2>/dev/null)" ]; then
@@ -65,7 +79,6 @@ fi
 JSON_OUT=false
 KEEP=false
 FOLLOW=false
-BG_MODE=false
 NEW_SESSION=false
 MODE="acp"
 # Allow callers (e.g. smoke tests) to override the default wait timeout.
@@ -90,15 +103,12 @@ while [[ $# -gt 0 ]]; do
     --json) JSON_OUT=true; shift ;;
     --keep) KEEP=true; shift ;;
     --follow) FOLLOW=true; shift ;;
-    --background|--bg) BG_MODE=true; shift ;;
     --new-session) NEW_SESSION=true; shift ;;
     --mode) MODE="$2"; shift 2 ;;
     --timeout) TIMEOUT="$2"; shift 2 ;;
     --no-log) LOG_THIS=false; shift ;;
     --status) CMD=status; HANDLE="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
     --kill)   CMD=kill;   HANDLE="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
-    --await)  CMD=await;  HANDLE="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
-    --result-file) CMD=result_file; HANDLE="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
     --events)  CMD=events;  HANDLE="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
     --metrics) CMD=metrics; HANDLE="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
     --log) CMD=log; shift ;;
@@ -198,38 +208,12 @@ print('\n'.join(t.get('tail', [])))
       echo "(no log file: $LOG_FILE)"
     fi
     exit 0 ;;
-  result_file)
-    [ -z "$HANDLE" ] && HANDLE=$(get_stored_handle)
-    [ -z "$HANDLE" ] && { echo "invoke-codebuddy: no handle" >&2; exit 2; }
-    echo "$STATE_DIR/result-$HANDLE.md"
-    exit 0 ;;
-  await)
-    [ -z "$HANDLE" ] && HANDLE=$(get_stored_handle)
-    [ -z "$HANDLE" ] && { echo "invoke-codebuddy: no handle" >&2; exit 2; }
-    local_result_file="$STATE_DIR/result-$HANDLE.md"
-    local_done_file="$STATE_DIR/done-$HANDLE"
-    # 优先 inotifywait (event-driven, 0 CPU)，fallback 到轮询
-    if command -v inotifywait >/dev/null 2>&1; then
-      inotifywait -qq -t "$TIMEOUT" -e create -e close_write "$STATE_DIR" 2>/dev/null || true
-    else
-      elapsed=0
-      while [ ! -f "$local_done_file" ] && [ "$elapsed" -lt "$TIMEOUT" ]; do
-        sleep 1; elapsed=$((elapsed+1))
-      done
-    fi
-    if [ -f "$local_result_file" ]; then
-      cat "$local_result_file"
-      exit 0
-    fi
-    echo "invoke-codebuddy: await timeout ($TIMEOUT s) for handle $HANDLE" >&2
-    exit 5
-    ;;
   events)
     [ -z "$HANDLE" ] && HANDLE=$(get_stored_handle)
     [ -z "$HANDLE" ] && { echo "invoke-codebuddy: no handle" >&2; exit 2; }
     local_events="$STATE_DIR/events-$HANDLE.jsonl"
     if [ ! -f "$local_events" ]; then
-      echo "invoke-codebuddy: no events file (use --background first or wrong handle)" >&2
+      echo "invoke-codebuddy: no events file (sync a call first or wrong handle)" >&2
       exit 2
     fi
     # 模式 1: cat 全部
@@ -339,8 +323,8 @@ print(json.dumps({'ok': True, 'mode': 'print', 'duration_s': $DT, 'result': out}
   exit 0
 fi
 
-# ── acp 同步模式: 直接跑 worker，wait done (仅在非 background 时跑) ───────────
-if [ "$MODE" = "acp" ] && [ "$BG_MODE" = false ]; then
+# ── acp 同步模式: 直接跑 worker，wait done ───────────
+if [ "$MODE" = "acp" ]; then
   HANDLE="acp-sync-$$-$(date +%s)"
   RESULT_FILE="$STATE_DIR/result-$HANDLE.md"
   DONE_FILE="$STATE_DIR/done-$HANDLE"
@@ -425,111 +409,8 @@ if [ "$MODE" = "tui" ] && { [ -z "$HANDLE" ] || [ "$NEW_SESSION" = true ]; }; th
 fi
 [ "$KEEP" = true ] && [ -n "$HANDLE" ] && echo "$HANDLE" > "$HANDLE_FILE"
 
-# 发任务 (只 TUI 走 orca terminal; acp-bg 自己开 worker, 不需要 TUI)
+# 发任务 (只 TUI 走 orca terminal; acp 自己开 worker, 不需要 TUI)
 [ "$MODE" = "tui" ] && $ORCA terminal send --terminal "$HANDLE" --text "$TASK" --enter --json >/dev/null
-
-# 异步 acp 模式: 启动 Python worker (acp 客户端，更丰富的状态)
-if [ "$MODE" = "acp" ] && [ "$BG_MODE" = true ]; then
-  if [ "$KEEP" = true ]; then echo "$HANDLE" > "$HANDLE_FILE"; fi
-  HANDLE="acp-$$-$(date +%s)"
-  RESULT_FILE="$STATE_DIR/result-$HANDLE.md"
-  DONE_FILE="$STATE_DIR/done-$HANDLE"
-  EVENTS_FILE="$STATE_DIR/events-$HANDLE.jsonl"
-  STATUS_FILE="$STATE_DIR/status-$HANDLE.json"
-  rm -f "$RESULT_FILE" "$DONE_FILE" "$EVENTS_FILE" "$STATUS_FILE"
-  # 构造 acp-worker 透传 flags (与 sync 模式完全一致)
-  WORKER_FLAGS=(
-    --task "$TASK"
-    --events-file "$EVENTS_FILE"
-    --status-file "$STATUS_FILE"
-    --result-file "$RESULT_FILE"
-    --done-file "$DONE_FILE"
-    --timeout "$TIMEOUT"
-  )
-  [ -n "$MODEL" ] && WORKER_FLAGS+=(--model "$MODEL")
-  # base prompt 路径交给 worker 自己读(不在主脚本里展开)
-  [ -n "$MCODE_BASE_PROMPT_FILE" ] && WORKER_FLAGS+=(--mcode-base-prompt-file "$MCODE_BASE_PROMPT_FILE")
-  if [ -n "$SYSTEM_PROMPT_FILE" ]; then
-    WORKER_FLAGS+=(--system-prompt-file "$SYSTEM_PROMPT_FILE")
-  elif [ -n "$SYSTEM_PROMPT" ]; then
-    WORKER_FLAGS+=(--system-prompt "$SYSTEM_PROMPT")
-  elif [ -n "$APPEND_SYSTEM_PROMPT" ]; then
-    WORKER_FLAGS+=(--append-system-prompt "$APPEND_SYSTEM_PROMPT")
-  fi
-  # 用 systemd-run --user --unit=NAME: 创建真正独立的 service unit
-  # (不能加 --scope, 因为 --scope 绑到父进程生命周期, 父退出就死)
-  # 这种 transient unit 在完成后会自动清理
-  UNIT="invoke-codebuddy-acp-$$-$(date +%s)"
-  if ! systemd-run --user --unit="$UNIT" \
-    python3 "$SCRIPT_DIR/invoke-codebuddy-acp-worker.py" \
-      "${WORKER_FLAGS[@]}" </dev/null >/dev/null 2>&1; then
-    # fallback: setsid + 双 fork
-    ( setsid python3 "$SCRIPT_DIR/invoke-codebuddy-acp-worker.py" \
-        "${WORKER_FLAGS[@]}" </dev/null >/dev/null 2>&1 & ) &
-    disown 2>/dev/null || true
-  fi
-  log_invoke "acp-bg" "$KEEP" "$HANDLE" "spawned" "0" "$TASK"
-  if [ "$JSON_OUT" = true ]; then
-    printf '{"ok":true,"mode":"acp","background":true,"handle":"%s","events_file":"%s","status_file":"%s","result_file":"%s","await_cmd":"invoke-codebuddy --await %s","metrics_cmd":"invoke-codebuddy --metrics %s"}
-' \
-      "$HANDLE" "$EVENTS_FILE" "$STATUS_FILE" "$RESULT_FILE" "$HANDLE" "$HANDLE"
-  else
-    printf 'background handle: %s\nevents file:    %s\nstatus file:    %s\nresult file:    %s\nawait:          invoke-codebuddy --await %s\nmetrics:        invoke-codebuddy --metrics %s\n' \
-      "$HANDLE" "$EVENTS_FILE" "$STATUS_FILE" "$RESULT_FILE" "$HANDLE" "$HANDLE"
-  fi
-  exit 0
-fi
-
-# 异步模式: 启动 + spawn detached watcher (写 result file + done marker)
-if [ "$BG_MODE" = true ]; then
-  if [ "$KEEP" = true ]; then echo "$HANDLE" > "$HANDLE_FILE"; fi
-  RESULT_FILE="$STATE_DIR/result-$HANDLE.md"
-  DONE_FILE="$STATE_DIR/done-$HANDLE"
-  rm -f "$RESULT_FILE" "$DONE_FILE"
-
-  # spawn watcher - detached, parent 不需要等
-  nohup bash -c "
-    WAIT_RC=0
-    $ORCA terminal wait --terminal '$HANDLE' --for tui-idle --timeout-ms $(($TIMEOUT * 1000)) >/dev/null 2>&1 || WAIT_RC=\$?
-    T0=\$(date +%s)
-    # 提取 result
-    $ORCA terminal read --terminal '$HANDLE' --json 2>/dev/null \
-      | python3 -c '
-import sys, json
-d = json.load(sys.stdin)
-tail = d.get(\"result\", {}).get(\"terminal\", {}).get(\"tail\", []) or []
-result = []
-capturing = False
-for line in tail:
-    s = line.rstrip()
-    if s.startswith(\"●\"):
-        if result: break
-        result.append(s.lstrip(\"● \").strip())
-        capturing = True
-    elif capturing:
-        if not s or s.startswith(\"─\") or s.startswith(\"> \"):
-            break
-        result.append(s)
-print(\"\\n\".join(result).strip() or \"(无可见回复 - 可能是长答案被 TUI 折叠)\")
-' > '$RESULT_FILE' 2>&1
-    T1=\$(date +%s)
-    touch '$DONE_FILE'
-    printf '%s\twatcher\ttui-bg-bg\tdur=%ss\thandle=$HANDLE\toutcome=rc%s\ttask=%s\n' \
-      \"\$(date '+%Y-%m-%dT%H:%M:%S%z')\" \"\$((T1-T0))\" \"\$WAIT_RC\" \"$TASK\" \
-      >> '$LOG_FILE'
-  " >/dev/null 2>&1 &
-  disown 2>/dev/null || true
-
-  log_invoke "tui-bg" "$KEEP" "$HANDLE" "spawned" "0" "$TASK"
-  if [ "$JSON_OUT" = true ]; then
-    printf '{"ok":true,"mode":"tui","background":true,"handle":"%s","result_file":"%s","await_cmd":"invoke-codebuddy --await %s"}\n' \
-      "$HANDLE" "$RESULT_FILE" "$HANDLE"
-  else
-    printf 'background handle: %s\nresult file:     %s\nawait:           invoke-codebuddy --await %s\n' \
-      "$HANDLE" "$RESULT_FILE" "$HANDLE"
-  fi
-  exit 0
-fi
 
 # 等回复
 T0=$(date +%s)

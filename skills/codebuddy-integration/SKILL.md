@@ -33,12 +33,10 @@ invoke-codebuddy --mode print "summarize: $(cat spec.md)"
 invoke-codebuddy --keep "explain this code in Chinese"
 invoke-codebuddy --follow "now translate to English"
 
-# async (ACP, default) — fire and forget, mcode keeps going, full state via ACP
-invoke-codebuddy --background "long task"        # returns handle + events/status/result file paths
-invoke-codebuddy --await <handle>                # blocks bash (0 mcode LLM tokens) until done
-invoke-codebuddy --result-file <handle>          # just prints the result file path
-invoke-codebuddy --metrics <handle>              # rich ACP state: phase / tokens / trace / by_category / system_prompt_mode
-invoke-codebuddy --events <handle>               # full event stream (JSONL, all phase + thought + message + usage)
+# async (>30s task) — wrap in mcode `task` tool with run_in_background=true
+#   worker 调 invoke-codebuddy-bridge.sh "<prompt>",bridge 内部用 sync 模式等结果
+#   mcode 用 <background-task-finished> 系统提醒自动 wake-up,不用 cron 轮询
+#   详细见下面 "Async pattern — task tool + bridge.sh"
 
 # model selection (default: let codebuddy server pick; e.g. try glm-5.2 / deepseek-v4-pro)
 invoke-codebuddy --model glm-5.2 "review this code for race conditions"
@@ -50,51 +48,50 @@ invoke-codebuddy --append-system-prompt "You are auditing for PCI-DSS. List ever
 # completely replace the mcode base prompt (rare; usually --append is enough)
 invoke-codebuddy --system-prompt-file ./strict-reviewer.md "review this PR"
 
-# async (TUI, when codebuddy needs to do real work in the worktree)
-#   - requires `orca-ide` on PATH; without it the script silently falls back
-#     to --mode print and prints a warning to stderr
-invoke-codebuddy --mode tui --background "edit this file"
+# read ACP state from a previous sync call's state files
+#   (sync 模式也写 events-/status- 文件; --metrics 打印人类可读 summary)
+invoke-codebuddy --metrics <handle>              # phase / tokens / trace / by_category / system_prompt_mode
+invoke-codebuddy --events <handle>               # full JSONL event stream
 ```
 
 ### Mode cheat sheet
 
-| Mode | `--background`? | Needs `codebuddy`? | Needs `orca-ide`? | Injects mcode base system prompt? | Use when |
-|------|-----------------|--------------------|-------------------|-----------------------------------|----------|
-| `print` (default for one-shot) | n/a | yes | **no** | **no** (lighter, faster) | first try, pure text, no worktree context |
-| `acp` (default) | n/a | yes | **no** | **yes** (default) | full ACP state + tokens + events; works without orca |
-| `acp` (default) + `--background` | yes | yes | **no** (uses `systemd-run` on Linux / `setsid` on macOS) | **yes** (default) | long task, fire-and-forget |
-| `tui` | n/a | yes | **yes** (with auto-fall-back to `print` if missing) | no (TUI is interactive) | codebuddy needs to read/edit worktree files via orca-ide terminal |
-| `tui` + `--background` | yes | yes | **yes** (with auto-fall-back) | no | long task in worktree context |
+| Mode | Needs `codebuddy`? | Needs `orca-ide`? | Injects mcode base system prompt? | Use when |
+|------|--------------------|-------------------|-----------------------------------|----------|
+| `print` | yes | **no** | **no** (lighter, faster) | first try, pure text, no worktree context |
+| `acp` (default) | yes | **no** | **yes** (default) | full ACP state + tokens + events; works without orca |
+| `tui` | yes | **yes** (auto-fall-back to `print` if missing) | no (TUI is interactive) | codebuddy needs to read/edit worktree files via orca-ide terminal |
 
 ## Installation
 
-After installing this plugin, three things must be true:
+`bin/install.sh` does **everything** for you (跨平台 — macOS / Linux 都跑同一脚本):
 
-1. The `invoke-codebuddy` script is on `$PATH` (or called by absolute path).
-2. The `codebuddy` CLI is on `$PATH` (or `CODEBUDDY_BIN` points to it).
-3. The `orca-ide` CLI is on `$PATH` **only if you want `--mode tui`** — otherwise it is optional (the script will warn and fall back to `--mode print`).
+1. Resolves the plugin root and writes `$HOME/.config/invoke-codebuddy/install-path` (anchors `state/` and `logs/`).
+2. `ln -sfn` the script to `~/bin/invoke-codebuddy` (or the first `~/X/bin` on `$PATH`).
+3. Detects the `codebuddy` CLI under `~/.nvm/`, `~/.local/`, `/opt/homebrew/bin/`, `/usr/local/bin/`, `/usr/bin/` and writes `$HOME/.config/invoke-codebuddy/env` (the main script sources it automatically, so no `export CODEBUDDY_BIN=` is needed).
+4. Auto-appends a `PATH` block (with marker) to `~/.zshrc` and `~/.bashrc` so new shells find `invoke-codebuddy`.
+5. Smoke-tests `invoke-codebuddy --help`.
 
 ```bash
-# 1) expose the script — use the bundled install.sh
-"$PLUGIN_ROOT/bin/install.sh"
-#    ↳ writes $HOME/.config/invoke-codebuddy/install-path (anchors plugin root)
-#    ↳ ln -sfn $PLUGIN_ROOT/bin/invoke-codebuddy ~/bin/invoke-codebuddy
-#    ↳ smoke-tests --help
-# Re-run after editing the plugin in place.
+"$PLUGIN_ROOT/bin/install.sh"   # 重装/同步: 直接再跑(覆盖式)
+```
 
-# 2) expose codebuddy (pick one)
-#    a) if it's already installed, just find it and put it on PATH:
-find ~/.nvm ~/.local /opt -name codebuddy -type l 2>/dev/null | head -3
-export CODEBUDDY_BIN="$(find ~/.nvm ~/.local -name codebuddy -type l 2>/dev/null | head -1)"
-#       (add the export to ~/.zshenv / ~/.bashrc to persist)
-#    b) or symlink it to a dir on PATH:
-ln -sf "$(command -v codebuddy 2>/dev/null || echo /path/to/codebuddy)" "$HOME/bin/codebuddy"
-#    c) or install fresh:
-#       npm i -g @tencent-ai/codebuddy-code
+If `install.sh` could not auto-detect the `codebuddy` CLI, install it and re-run:
 
-# 3) (only if you need --mode tui) install orca-ide
-#    brew install --cask orca-ide   # macOS
-#    see https://github.com/hetaoBackend/orca for Linux / other
+```bash
+# pick one
+npm i -g @tencent-ai/codebuddy-code        # fresh install
+ln -s /abs/path/to/codebuddy ~/bin/codebuddy   # already installed, just expose
+# then re-run:  "$PLUGIN_ROOT/bin/install.sh"
+```
+
+If you want `--mode tui` (codebuddy reading/editing files in the current orca worktree), you also need `orca-ide` on `$PATH`. **Without it the script silently falls back to `--mode print`** — see the Mode cheat sheet above.
+
+```bash
+# macOS
+brew install --cask orca-ide
+# Linux / other
+# see https://github.com/hetaoBackend/orca
 ```
 
 > **`~/.codebuddy/bin/` is a directory created by the CodeBuddy CN.app macOS
@@ -111,7 +108,7 @@ is a symlink pointing somewhere else:
 
 1. `$CODEBUDDY_PLUGIN_DIR` env var (mavis / mcode can inject this when it installs the plugin),
 2. `$HOME/.config/invoke-codebuddy/install-path` (written by `bin/install.sh`),
-3. `readlink -f "$0"` of the script itself (fallback).
+3. `os.path.realpath` of the script itself via `python3` (跨平台 — macOS BSD `readlink` 没有 `-f`,所以用 python)。
 
 ## When to invoke
 
@@ -132,6 +129,41 @@ Do NOT use `invoke-codebuddy` for:
 - Fine-grained tool iteration where the user can see each step — codebuddy's iteration is
   opaque; for "fix the failing test in this file" use mcode's own tools.
 
+### Choose the right execution path (REQUIRED first step)
+
+**Before calling `invoke-codebuddy`**, the agent must **detect the current environment** and
+pick the right path. There are exactly two paths:
+
+| Environment detection | Path to use |
+|-----------------------|-------------|
+| `command -v orca-ide` succeeds AND we are inside an orca worktree (we need codebuddy to read/edit files in the worktree) | `--mode tui` (opens an orca-ide terminal; codebuddy can read/write files in the worktree; multi-turn via `--keep` / `--follow`) |
+| Anything else (no orca-ide, or codebuddy only needs to do text reasoning) | **mcode `task(run_in_background=true)` + worker calls `invoke-codebuddy-bridge.sh "<prompt>"`** (sync mode, ~5-30s; mcode wakes up via `<background-task-finished>`) |
+
+**Why this matters**: the two paths are not equivalent.
+
+- `--mode tui` requires `orca-ide` and a running orca worktree. It gives codebuddy the
+  ability to read and edit files in the worktree, which is what makes it "share the
+  worktree with the user". If you don't have that, this path silently falls back to
+  `--mode print` and the user is left wondering why file edits didn't happen.
+
+- The task + background path is the default and works everywhere. It does **not** share
+  the worktree — codebuddy only sees the prompt and returns a text reply. The agent
+  does file edits in subsequent turns using mcode's own `read` / `write` / `edit` tools.
+
+**Decision flow**:
+
+```text
+1. Is this a text-reasoning task? (translate, summarize, review, design, brainstorm)
+   ├─ No  → use mcode's own tools, not codebuddy
+   └─ Yes ↓
+2. Does codebuddy need to read/edit files in the user's worktree?
+   ├─ No  → task(run_in_background=true) + invoke-codebuddy-bridge.sh
+   └─ Yes ↓
+3. Do we have orca-ide AND an orca worktree?
+   ├─ Yes → invoke-codebuddy --mode tui (or --keep / --follow for multi-turn)
+   └─ No  → fall back to task + bridge.sh; tell the user file edits are not possible
+```
+
 ### Trigger examples
 
 If the user says any of the following, invoke `invoke-codebuddy`:
@@ -143,6 +175,39 @@ If the user says any of the following, invoke `invoke-codebuddy`:
 - "summarize this with codebuddy" (when input is > 10k chars)
 
 If unsure, ask the user — the decision is theirs because it costs their credits.
+
+### Permission pre-emption — preventing the question that kills progress
+
+Codebuddy's default behavior is to ask the user for permission before destructive actions
+(write a file, run a shell command, etc.). In a subagent context (no human in the loop),
+this **hangs the task indefinitely**. Live-verified: the worker keeps waiting, the
+`codebuddy` process never returns, and `<background-task-finished>` never fires.
+
+**Two defenses, applied in this order**:
+
+1. **Always pass `--dangerously-skip-permissions` (alias `-y`)** + `--permission-mode
+   bypassPermissions` + `--subagent-permission-mode bypassPermissions` to `codebuddy`.
+   The plugin's `bin/invoke-codebuddy-acp-worker.py` already does this in acp mode. If
+   you are calling codebuddy directly (e.g. `codebuddy --print ...` in print mode), add
+   the same flags yourself.
+
+2. **In the worker's prompt, explicitly say "do not ask the user any question"**. The
+   `bypassPermissions` flag bypasses codebuddy's permission gate, but other "clarify"
+   moments (e.g. ambiguous scope, missing parameter) can still pause. Tell codebuddy
+   in the prompt: "Make a reasonable choice and proceed; do not stop to ask the
+   user. Burning a few extra seconds of inference is better than hanging the task."
+
+If both defenses are applied, codebuddy in acp mode does NOT block on questions
+(live-verified on 2026-08-17: a 7-second end-to-end call to write a file in `/tmp`
+completed without any interactive prompt).
+
+### What if acp `--dangerously-skip-permissions` is NOT enough?
+
+The mcp-bridge + session-tick fallback pattern (acp over mcp + cron-driven `task_query`
+on the current session) was considered as a workaround for tasks that genuinely need
+bidirectional question/answer with codebuddy. **Do not implement it** unless a real
+case is observed where `-y` is not enough. The `--y` flag is sufficient for
+fire-and-forget text-reasoning subtasks, which is what this plugin is for.
 
 ## Modes
 
@@ -167,21 +232,24 @@ so you still get a result. Pass `--mode print` for the cheapest, fastest, no-sid
 | `--json` | false | output structured JSON with `ok`, `mode`, `duration_s`, `result` |
 | `--keep` | false | leave the codebuddy terminal alive after the task; saves handle to `state/handle` |
 | `--follow` | false | reuse the handle from `state/handle`; implies `--keep` |
-| `--background` | false | do not wait for response; print handle and exit |
 | `--new-session` | false | force a fresh terminal (close any existing one in `state/handle` first) |
 | `--mode tui\|print` | `acp` (sugar: `tui` or `print` accepted) | `tui` = orca-ide terminal (worktree context); `print` = `codebuddy --print` (cleaner, no worktree). `tui` auto-falls-back to `print` if `orca-ide` is not in PATH. |
 | `--timeout <sec>` | 300 | max wait time for the response |
 | `--no-log` | false | skip writing to `logs/invocations.log` |
 | `--log [N]` | 20 | print last N invocations and exit |
-| `--status <handle>` | — | print current tail of the codebuddy terminal |
-| `--await <handle>` | — | **block** until the background task writes its result file, then print the result. Uses `inotifywait` if available, else polls every 1s. Burns 0 mcode LLM tokens. |
-| `--result-file <handle>` | — | print the absolute path of the result file (so mcode can `inotifywait` / `tail -f` it itself) |
-| `--kill [handle]` | — | close the codebuddy terminal; handle defaults to `state/handle` |
-| `--model <id>` | server default (currently `hy3`) | pin a codebuddy model id; use `--metrics <handle>` on any prior call to see `available_models` |
+| `--status <handle>` | — | print current tail of the TUI terminal (worktree context) |
+| `--kill [handle]` | — | close the TUI terminal; handle defaults to `state/handle` |
+| `--events <handle>` | — | dump acp-mode event stream (JSONL) for a prior sync call — phase / thought / message / usage |
+| `--metrics <handle>` | — | pretty-print acp-mode status (phase, prompt_tokens, trace_id, system_prompt_mode, etc.) for a prior sync call |
+| `--model <id>` | server default (let codebuddy pick) | pin a codebuddy model id; use `--metrics <handle>` on any prior call to see `available_models` |
 | `--system-prompt <text>` | mcode base prompt | completely replace the mcode base system prompt with this text |
 | `--system-prompt-file <path>` | mcode base prompt | completely replace the mcode base system prompt with file contents |
 | `--append-system-prompt <text>` | _(none)_ | append business rules **after** the mcode base system prompt (text) |
 | `--help` | — | show usage |
+
+> **No `--background` flag.** Long tasks (>30s) belong to mcode's `task` tool with
+> `run_in_background=true`; the worker calls `invoke-codebuddy-bridge.sh` (sync)
+> and mcode wakes up via `<background-task-finished>`. See "Async pattern" below.
 
 ### What comes back
 
@@ -257,280 +325,44 @@ invoke-codebuddy "用 Python 写一个 LRU cache，30 行以内，含单元测�
 invoke-codebuddy --mode print "$(cat huge.log) — 上面日志里有几次 ERROR？"
 ```
 
-### Async pattern — fire and forget, mcode keeps working
+## Async pattern — `task(run_in_background=true)` + `bridge.sh`
 
-```bash
-# 1. mcode 启动后台任务（~5s 启动时间），返回 handle + result-file
-HANDLE=$(invoke-codebuddy --background "用 Python 写一个完整的 HTTP server")
-RESULT_FILE=$(invoke-codebuddy --result-file "$HANDLE")
-echo "task started, will write to: $RESULT_FILE"
-
-# 2. mcode 在同一个 bash 调用里干别的活 (4-8s)
-do_something_else_useful
-sleep 3
-
-# 3. mcode 等结果 - bash 阻塞，0 mcode LLM tokens
-RESULT=$(invoke-codebuddy --await "$HANDLE")
-echo "codebuddy 答: $RESULT"
-
-# 4. (可选) 用 --kill 关 terminal，或留 --keep 等后续追问
-invoke-codebuddy --kill "$HANDLE"
-```
-
-`invoke-codebuddy --background` returns immediately after spawning a detached watcher that
-runs the actual codebuddy task. The watcher writes `state/result-<handle>.md` and
-`state/done-<handle>` when finished. `--await` blocks on those files (using `inotifywait`
-when available, else 1s polling). **No mcode LLM tokens are burned during the wait** —
-mcode's bash tool just blocks at the kernel level.
-
-If `inotifywait` is not installed, install it for zero-CPU waits: `apt install inotify-tools`
-(macOS: `brew install inotify-tools`). The polling fallback is fine for tasks ≥ 5s.
-
-The `--mode acp` (default) worker runs in a `systemd-run --user` transient service unit
-so it survives the bash tool's session cleanup. Each invocation gets a unique handle
-(`acp-<pid>-<ts>`), writes JSONL events + JSON status snapshot + final result, and
-cleans up. `--metrics` reads the live status JSON, so mcode can poll for progress at
-any time:
-
-```bash
-# Async with full ACP state monitoring
-HANDLE=$(invoke-codebuddy --background "用 Python 写一个 5 行的 LRU cache")
-echo "background: $HANDLE"
-
-# mcode does other work for ~3s
-sleep 3
-
-# Check current state (no LLM cost)
-invoke-codebuddy --metrics $HANDLE
-#  handle:         acp-XXXXX-XXXXXXX
-#  phase:          model_streaming
-#  outcome:        None
-#  duration:       Nones           (still running)
-#  trace_id:       None
-#  tokens:         prompt=0 completion=0 reasoning=0 cache_hit=0
-#  context:        used=0/192000 (0.0%)
-#  by_category:    {systemPrompt:0, conversation:0, tools:0, mcp:0, skills:0}
-
-# Wait for final result
-RESULT=$(invoke-codebuddy --await $HANDLE)
-echo "codebuddy 答: $RESULT"
-
-# Now --metrics shows final stats
-invoke-codebuddy --metrics $HANDLE
-#  phase:          done
-#  outcome:        SUCCESS
-#  duration:       7.5s
-#  trace_id:       6ffe777f...
-#  tokens:         prompt=28105 completion=19 reasoning=0 cache_hit=27776
-#  context:        used=28105/192000 (14.6%)
-#  by_category:    {systemPrompt:2060, conversation:4246, tools:21415, ...}
-```
-
-The `trace_id` correlates to codebuddy's internal log; the user can use it for support
-requests. The token breakdown shows exactly how many tokens each subsystem ate — useful
-for understanding where the codebuddy credit is going.
-
-## Subagent integration — REAL behavior, not wishful
-
-**Important — this section was wrong in 0.1.0/0.1.1 and was rewritten after
-real usage in 0.1.2/0.1.3.** mcode's `task` tool runs an Agent-team-style
-synchronous subagent dispatch. **There is no true "fire-and-forget +
-completion callback" path** in the tools currently exposed to the main
-agent. Read this section as a record of what *actually happens*, not as a
-promise.
-
-For tasks that take more than ~10 seconds (long-context summarization, deep
-code review, multi-step implementation drafts), wrap `invoke-codebuddy` in
-a `task` call so the worker LLM does the bash invocation and the bridge
-script's `--await` wait. The main agent's current turn **will block** until
-the worker finishes — that is the price of using this path. If you need to
-do other work in parallel, you must let this turn end and start a new one.
-
-### What you cannot do today (as of 0.1.3)
-
-- "派完 task 立刻在同一 turn 继续干别的事" — the `task` tool's foreground
-  variant blocks until the worker returns. Setting `run_in_background=true`
-  does not change this in practice for the way the tool is currently wired
-  up; the only fire-and-forget that actually returns immediately is a
-  detached child that you re-check via `task_query` / `task_output` on a
-  later turn.
-- "codebuddy 完成时主 agent 立刻被 push 通知" — there is no push channel
-  into the LLM. Subagent completion is observed at the start of a new
-  turn, when the main agent calls `task_query` / `task_output` and sees the
-  status has flipped to `succeeded`.
-- "codebuddy 提问时主 agent 实时给具体响应" — same reason. The fix is to
-  pre-empt questions (see "Permission pre-emption" below), not to handle
-  them in-flight.
-
-### The pattern that actually works
-
-1. From the **main agent** (mcode), call the `task` tool. The default
-   foreground variant is what you want here — it returns the worker's
-   final answer in the same turn.
-
-2. The worker subagent runs `invoke-codebuddy-bridge.sh "<prompt>"` from
-   its own bash tool. The bridge does `invoke-codebuddy --json --background`
-   (so the handle is a single line) then `invoke-codebuddy --await` (event-
-   driven via `inotifywait` on `state/done-<handle>`), and prints
-   codebuddy's reply on stdout. The worker then copies that stdout into its
-   final answer.
-
-3. The main agent's turn is over when the worker returns. The next turn can
-   be a follow-up tool call, a `task_query` of a different background task,
-   or a user message.
-
-### Permission pre-emption (CRITICAL)
-
-In 0.1.3, every codebuddy launch is started with
-`--dangerously-skip-permissions --permission-mode bypassPermissions
---subagent-permission-mode bypassPermissions`. The third flag is the one
-that 0.1.0/0.1.1 was missing: **codebuddy's own subagents/teammates run
-their own permission system, and without the subagent flag they will hit
-`waiting_for_permission` and hang until the bridge's 300 s timeout.**
-If you see `phase=waiting_for_permission` in a status JSON, that is the
-exact symptom.
-
-If you do want codebuddy to ask before doing something destructive
-(typically: editing your plugin source files), pass a stricter prompt:
-"do not edit any file outside /tmp; refuse any edit to plugin sources".
-The `-y` flags above just mean "if a question comes up, answer it as
-the user would, don't block waiting for a human".
-
-### Example main-agent prompt
+**The plugin does NOT provide a `--background` flag.** Background work
+belongs to mcode's `task` tool, not to a script trying to daemonize itself
+across the bash tool's session boundary. Concretely:
 
 ```text
-# In the main mcode agent (use the `task` tool, not bash):
-#
-# Expect: this turn blocks until the worker returns (~30 s-5 min).
-
+# From the main mcode agent (use the `task` tool, NOT bash):
+# This returns a task_id immediately. Your current turn ends.
 task(
+  description="codebuddy review",
   agent_name="worker",
+  run_in_background=true,
   prompt="""\
-Run exactly this command via your bash tool and return its stdout as
-your final answer, without modification:
+Run this single command via your bash tool and return its stdout
+as your final answer, verbatim:
 
   invoke-codebuddy-bridge.sh 'review this 50k-token spec for breaking API changes, list 5 in priority order'
 
-If the command times out, return whatever it printed verbatim so I can
-see the failure. Do not call any other tool.
+If the command exits non-zero, return whatever it printed verbatim
+so I can see the failure. Do not call any other tool.
 """
 )
 ```
 
-### When to use a smaller surface instead
-
-- A short prompt (< 10 s round-trip): call `invoke-codebuddy` directly
-  via your own bash tool. Wrapping it in `task` adds Agent-team overhead
-  for no benefit.
-- A task that needs the result mid-reasoning in the same tool call: same
-  as above — direct call, no `task` wrapper.
-- Multiple parallel codebuddy reviews: see "Background variant" below.
-
-### Background variant (when you do not need this turn's result)
-
-```text
-# Returns a task_id immediately, current turn ends. The next turn can
-# task_query(task_id) to check status; task_output(task_id) returns
-# immediately once the task has flipped to "succeeded".
-task(
-  agent_name="worker",
-  run_in_background=true,
-  prompt="...",
-)
-```
-
-In 0.1.3 this still ends your turn, but does not block the LLM on the
-worker's actual completion. The user perceives the worker as running in
-the background; the main agent's next turn sees the result.
-
-### Background variant + watchdog (the pattern you should actually use)
-
-The `task` tool has **no timeout parameter** (verified in 0.1.3: its
-schema exposes only `agent_name`, `prompt`, `model_config_id`, and
-`run_in_background`). A worker that gets stuck — e.g. codebuddy
-waiting on a permission prompt, or the worker's LLM looping on a
-retry — will hold the task in `running` forever (until the bridge's
-internal 300 s `await` timeout fires, which only unblocks the worker
-if codebuddy itself returns; it does not unblock a hung worker LLM
-turn). Live reproduction: the 0.1.2 second review ran for ~9 minutes
-before the task was eventually aborted externally.
-
-The standard pattern is **background + watchdog**:
-
-1. Spawn the worker with `run_in_background=true`. The current turn
-   ends immediately. Save the returned `task_id`.
-2. On a later turn, call `task_query(task_id)` — **returns instantly**
-   with one of `queued | running | stopping | succeeded | failed |
-   canceled | lost`.
-3. If status is `running` and `started_at + N_minutes` has passed,
-   call `task_stop(task_id)` to force-kill. There is no built-in
-   timeout, so **N is your choice** — pick something like 5-10 min
-   for a code review, 1-2 min for a translate/summarize, 15 min for
-   a multi-file implementation draft.
-4. If status is `succeeded` or `failed`, call `task_output(task_id)`
-   for the worker's final answer (returns immediately, no blocking).
-
-```text
-# Turn 1: spawn and end the turn immediately
-task_id = task(
-  agent_name="worker",
-  run_in_background=true,
-  prompt="invoke-codebuddy-bridge.sh 'review plugin X'",
-)
-
-# ... some time passes; main agent gets a new turn (user message, or
-# a new tool call, or `update_goal` polling) ...
-
-# Turn N: check and act
-status = task_query(task_id)   # returns instantly
-if status == "succeeded":
-    answer = task_output(task_id)
-elif status == "failed":
-    report_failure(task_id)
-elif status == "running" and too_long_running(task_id):
-    task_stop(task_id)        # force-kill; no further output will arrive
-```
-
-This is the closest you get to "true fire-and-forget with timeout"
-in current mcode. It costs an extra turn each time you check status,
-but the main agent is never stuck on a hung worker.
-
-### Subagent "question" handling — why we pre-empt, not respond
-
-In 0.1.3, every codebuddy launch runs with
-`--dangerously-skip-permissions --permission-mode bypassPermissions
---subagent-permission-mode bypassPermissions`. This means **codebuddy
-will not actually ask the user any permission question**; if a
-"question" would otherwise come up, codebuddy answers it as the
-default-allow user and proceeds. The subagent-mode flag is the one
-that was missing in 0.1.0-0.1.2 and caused the famous
-`waiting_for_permission` hang.
-
-If you want codebuddy to be more conservative (e.g. refuse to edit
-plugin source files), put that constraint in the **worker's prompt**:
-
-```text
-"codebuddy should not edit any file outside /tmp; if it tries to edit
- plugin sources, refuse and continue with a textual suggestion only"
-```
-
-The main agent never needs to "respond" to a codebuddy question in
-real time, because codebuddy will not ask. (If the worker LLM itself
-gets stuck on something and the task hangs, the watchdog above is
-the only way out — there is no live answer-back channel.)
+`invoke-codebuddy-bridge.sh` is a **sync wrapper**: it does one
+`invoke-codebuddy --json "$@"` (default acp mode, ~5-30s) and prints
+codebuddy's reply on stdout. The worker LLM literally copies that
+stdout into its final answer — almost no LLM tokens burned on the
+worker side.
 
 ### The free wake-up you already have: `<background-task-finished>`
 
-This is the part that surprised us in 0.1.5. mcode's runtime already
-implements a turn-boundary wake-up: when a background `task` flips to
-a terminal state, mcode injects a `<background-task-finished>`
-system reminder into the current session on the next turn. **You
-do not need cron, polling, or any external mechanism to be notified
-that a background codebuddy task finished.** The owning conversation
-resumes automatically.
-
-Concretely, the pattern that works on mcode 0.1.2+ with this plugin
-0.1.4+ is:
+mcode's runtime implements a turn-boundary wake-up: when a background
+`task` flips to a terminal state, mcode injects a
+`<background-task-finished>` system reminder into the current session
+on the next turn. **No cron, no polling, no manual check needed.** The
+owning conversation resumes automatically.
 
 1. **Turn N (this turn)**: spawn the worker with `run_in_background=true`.
    The tool returns a `task_id` immediately; your current turn ends.
@@ -544,119 +376,74 @@ Concretely, the pattern that works on mcode 0.1.2+ with this plugin
    answer), and surface the result.
 
 This is the **default and recommended pattern** for any codebuddy task
-that takes longer than ~30 s. Live-verified in 0.1.5: a
-`run_in_background=true` smoke test with `agent_name="worker"` and
-`prompt="invoke-codebuddy-bridge.sh '用 5 个字说 hi'"` completed in
-~5 s, and the main LLM was automatically woken by
-`<background-task-finished>` on the next turn with the result
-"你好呀世界" already buffer in `task_output`. No cron, no polling,
-no user prompt.
+that takes longer than ~30 s. Live-verified on mcode 0.1.2+ with this
+plugin 0.2.1+: a `run_in_background=true` worker running
+`invoke-codebuddy-bridge.sh '用 5 个字说 hi'` completed in ~5 s, and
+the main LLM was woken on the next turn with the result already
+buffered in `task_output`.
 
-### Wake-up pattern: `mavis cron once` self-poke (subagent session only)
+### When to use direct sync instead
 
-For long-running codebuddy work that you would like to come back to
-**without the user having to ask**, combine the background `task` with
-`mavis cron once` set to a future turn. This is the closest you get
-in current mcode to "派完 codebuddy，主 agent 干别的事，过 N 分钟
-自动回来拿结果" without building any new infrastructure. The cron
-once fires into the same session as a user-role message; on the next
-turn the main agent (or you, in this case) reads the cron prompt and
-picks up where it left off.
+- A short prompt (< 10 s round-trip): call `invoke-codebuddy` directly
+  from your own bash tool. Wrapping it in `task` adds Agent-team
+  overhead for no benefit.
+- A task that needs the result mid-reasoning in the same tool call: same
+  as above — direct call, no `task` wrapper.
+- Multiple parallel codebuddy reviews: spawn N `task(run_in_background=true)`
+  calls in one turn. mcode wakes you once for each
+  `<background-task-finished>`.
+
+### Watchdog for hung tasks (rare but possible)
+
+The `task` tool has no built-in timeout. A worker that gets stuck —
+e.g. the worker LLM itself looping, or codebuddy hung on a network
+call past `--timeout` — will hold the task in `running` forever.
+
+Standard pattern: spawn with `run_in_background=true`, then on later
+turns if `task_query(task_id).status == "running"` and
+`started_at + N_minutes` has passed, call `task_stop(task_id)`. Pick
+N by task type (5-10 min for a code review, 1-2 min for a
+translate/summarize, 15 min for a multi-file implementation draft).
 
 ```text
-# Turn 1: spawn the worker in the background, then immediately
-# schedule a self-poke. Both calls are non-blocking.
-
-task_id = task(
-  description="long codebuddy review",
-  agent_name="worker",
-  run_in_background=True,
-  prompt="""\
-Run: invoke-codebuddy-bridge.sh 'review this 50k-token spec for breaking API changes'
-
-If the command exits 0, print its stdout verbatim.
-If it exits non-zero, print whatever it printed verbatim so I can see
-the failure.
-Do not call any other tool.
-"""
-)
-
-# Self-poke: 5 minutes from now, inject a user-role turn into this
-# same session. The new turn's prompt is the cron prompt; the LLM
-# will execute it as a fresh turn.
-mavis({
-  command: "cron once",
-  args: {
-    cron_name: "codebuddy-self-check",
-    after: "5m",
-    prompt: """\
-Check the background codebuddy review (task_id={task_id}):
-
-  status = task_query({task_id})
-  if status == "succeeded":
-      answer = task_output({task_id})
-      # ... summarize and surface to the user
-  elif status == "running":
-      # Re-schedule another self-poke in 60s, OR give up if too long
-      mavis({{ command: "cron once", args: {{
-        cron_name: "codebuddy-self-check",
-        after: "60s",
-        prompt: <this same prompt>,
-        session: {{ mode: "sessionId", session_id: "me" }}
-      }}})
-  elif status in ("failed", "stopped", "canceled", "lost"):
-      # ... report failure
-""",
-    session: { mode: "sessionId", session_id: "me" }
-  }
-})
-# Both calls return immediately. Your current turn ends here.
+# On a later turn, when checking a long-running task:
+status = task_query(task_id)   # returns instantly
+if status == "succeeded":
+    answer = task_output(task_id)
+elif status == "failed":
+    report_failure(task_id)
+elif status == "running" and too_long_running(task_id):
+    task_stop(task_id)        # force-kill; no further output will arrive
 ```
 
-Notes on this pattern:
+### Permission pre-emption
 
-- The self-poke prompt is the contract. Make it idempotent: re-running
-  it should be safe (check status, don't double-act). Re-arming the
-  cron is how you implement "wait longer" without holding a socket.
-- Use `session_id: "me"` (the literal string) so the cron routes
-  into the current session. `agent_name` is optional in this mode;
-  the runtime derives the agent from the target session.
-- `after` accepts durations like `"5m"`, `"60s"`, `"1h30m"`. The
-  parser is shared with `cron self`'s `every` and the `task_output`
-  timeout; millisecond-scale values are not documented.
-- The cron-fired turn is a **fresh user-role turn**, not an in-band
-  tool result. The LLM treats the cron prompt as a new request from
-  the user. This is the closest you get to a wake-up without
-  changes to mcode.
-- If the task already finished before the cron fires, the cron turn
-  will see `succeeded` and call `task_output` immediately. If the
-  task is still running, the cron prompt can re-arm itself.
-- Safety budget: pick a maximum number of re-arms (e.g. "after 6
-  re-arms, `task_stop` the task"). Without a budget, a hung task
-  will keep re-arming the cron indefinitely.
-- **Important: the `mavis` tool is not exposed to the root session.**
-  mcode hides the `mavis` CLI tool from the primary Mavis agent (by
-  design — `agent list` defaults to `include_primary=false`). The
-  `cron once` self-poke pattern only works in **subagent sessions**,
-  e.g. from inside a `task` worker. For the root session's own
-  "fire and forget a codebuddy review" use case, prefer the default
-  `<background-task-finished>` wake-up above — it works without
-  needing `mavis` at all.
+Every codebuddy launch (`bin/invoke-codebuddy-acp-worker.py` line 269)
+starts with `--dangerously-skip-permissions --permission-mode
+bypassPermissions --subagent-permission-mode bypassPermissions`. The
+third flag is critical: **codebuddy's own teammates run their own
+permission system**, and without the subagent flag they will hit
+`waiting_for_permission` and hang until `--timeout` fires. With it,
+codebuddy will not actually ask the user any permission question; if
+a "question" would otherwise come up, codebuddy answers it as the
+default-allow user and proceeds.
 
-### Hard rules when using any wake-up pattern
+If you do want codebuddy to be more conservative (e.g. refuse to
+edit plugin source files), put that constraint in the worker's
+prompt — the main agent never needs to "respond" to a codebuddy
+question in real time, because codebuddy will not ask.
 
-- Always use `run_in_background=True` on the `task` call. Foreground
-  defeats the whole point and blocks the current turn.
-- If using `mavis cron once` (subagent session only): set
-  `session.mode: "sessionId"` and `session_id: "me"` on
-  the cron. `mode: "new"` would create a *separate* session that
-  the user is not looking at.
-- Do not stack more than 1-2 re-arms in flight. Each re-arm uses a
-  mavis cron slot; if you spawn 10 in 5 minutes you are creating
-  more pressure than you are saving.
-- Always end your current turn **immediately** after scheduling the
-  cron. The whole point is to release the LLM to do other things; if
-  you keep reasoning in the same turn, you block yourself.
+### Hard rules
+
+- **Always use `run_in_background=true`** for the `task` call when
+  delegating codebuddy. Foreground defeats the whole point and blocks
+  the current turn.
+- **Never wrap `invoke-codebuddy --background`** (the flag no longer
+  exists). The script does not manage detached processes; that is the
+  `task` tool's job. If a worker needs codebuddy, it calls
+  `invoke-codebuddy-bridge.sh` (sync) and returns the result.
+- **Worker prompt should be one command**: `invoke-codebuddy-bridge.sh
+  '<prompt>'`. Anything more burns worker LLM tokens for no benefit.
 
 ## Troubleshooting / failure recovery
 
@@ -670,8 +457,8 @@ Notes on this pattern:
 | `invoke-codebuddy: need handle (arg or .../state/handle)` | `--status` / `--kill` with no handle and no stored handle | pass the handle explicitly, or use `--keep` / `--follow` first to create one |
 | `orca terminal close` hangs or errors | orca-ide is not running | `orca-ide status --json`; if `runtime.reachable=false`, start with `orca-ide open` |
 | `invoke-codebuddy: failed to create codebuddy terminal` | orca worktree context lost or auth expired | `orca-ide worktree current --json`; re-auth codebuddy if needed |
-| Codebuddy times out (>5 min) | long task or rate limit | re-run with `--background` and poll with `--status`; or split into smaller prompts |
-| `--mode tui` works on Linux but hangs on macOS | macOS has no `systemd-run`; the script's fallback to `setsid` for `--background` is less robust than the systemd path | for macOS, prefer `--mode print` for one-shots, and `--mode tui` (foreground) without `--background` for in-worktree work; long-running macOS background tasks may need a manual `nohup … &` wrapper |
+| Codebuddy times out (>5 min) | long task or rate limit | split into smaller prompts; or use `task(run_in_background=true)` + `invoke-codebuddy-bridge.sh` and let the worker run with no perceived mcode cost |
+| `unknown flag: --background` | the flag was removed in 0.2.1 (was unreliable across macOS/Linux); use `task(run_in_background=true)` + `invoke-codebuddy-bridge.sh` instead | see "Async pattern" above |
 
 ### Hard rules
 
@@ -682,8 +469,10 @@ Notes on this pattern:
   `state/handle`.
 - **ALWAYS** set `invoke-codebuddy` to a sane `--timeout` (default 300s); codebuddy can
   hang on slow API calls and `tui-idle` waits up to that.
-- **ALWAYS** prefer one well-formed prompt over multiple retries; each call costs ~28k
-  tokens regardless of prompt length.
+- **ALWAYS** prefer one well-formed prompt over multiple retries; each acp-mode call
+  costs ~24k codebuddy input tokens (mcode base system prompt + tool catalog). The
+  prompt itself is negligible on top of that. First call of a session is ~24k;
+  subsequent calls are mostly cache-hit (often 95%+ cache_read_tokens).
 
 ## File layout (after install)
 
