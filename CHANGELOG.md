@@ -4,6 +4,16 @@ All notable changes to this plugin are documented in this file. The format is ba
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.4] - 2026-08-18
+
+### Fixed
+- **SKILL.md "Long prompt" rule was wrong** about "Each worker has its own subprocess and cache". The real behavior: mcode's MCP server pool may share the same `codebuddy-mcp-server.py` wrapper across workers, and codebuddy prompts **serialize at the model layer** (one reader thread + one `codebuddy --acp`). Wall clock across N workers ≈ Σ individual call durations, not max. Each worker that enters the wrapper gets its own `acp_session_id` and a fresh `prompt_tokens` prefix cache.
+
+### Added
+- **Async from the agent's perspective** (`task(run_in_background=true)`): the agent's wall clock is not blocked by the codebuddy call. Verified 2026-08-18 by 10+ independent operations (git log, file reads, unit tests, fib) overlapping a 19.32s background codebuddy call. Use `task_output(task_id)` to retrieve the result whenever ready.
+- **Failed prompts stay in the acp session history**: a `stop=refusal` (or any non-`end_turn`) does not clear the prompt. The next model you switch to will see the full history including refused prompts and may "catch up" by answering them in one reply.
+- **`(no message received from codebuddy)` + `stop=refusal` + 0 tokens = rate limit 429** (for the free-tier default `hy3`, x0.00 credits). Workaround: pass `model="deepseek-v4-flash"` (0.08 credits) or any other paid-tier model, which is unaffected. Check `codebuddy models` outside the MCP wrapper to see the actual 429 reset time.
+
 ## [0.3.3] - 2026-08-18
 
 ### Fixed
