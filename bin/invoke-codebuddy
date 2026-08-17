@@ -117,7 +117,13 @@ if [ -n "$SYSTEM_PROMPT" ] && [ -n "$SYSTEM_PROMPT_FILE" ]; then
   echo "invoke-codebuddy: --system-prompt 与 --system-prompt-file 互斥,后者优先;忽略 --system-prompt" >&2
   SYSTEM_PROMPT=""
 fi
-# --append-system-prompt(-file) 必须配合 base system prompt 才有意义;如果 base 缺失则报错
+# 预检 --system-prompt-file 存在性(避免 codebuddy 静默 fall back 到默认 prompt)
+if [ -n "$SYSTEM_PROMPT_FILE" ] && [ ! -f "$SYSTEM_PROMPT_FILE" ]; then
+  echo "invoke-codebuddy: --system-prompt-file 不存在或不可读: $SYSTEM_PROMPT_FILE" >&2
+  echo "  (避免被 codebuddy 静默忽略 — 它收到不存在的 path 时会 silently fall back 到默认 prompt)" >&2
+  exit 2
+fi
+# --append-system-prompt 必须配合 base system prompt 才有意义;如果 base 缺失则报错
 if [ -n "$APPEND_SYSTEM_PROMPT" ] && [ -z "$MCODE_BASE_PROMPT_FILE" ]; then
   echo "invoke-codebuddy: --append-system-prompt 需要 base system prompt,但 $SKILL_DIR/assets/mcode-base-system-prompt.md 不存在" >&2
   exit 2
@@ -247,6 +253,16 @@ print('  phase:          ' + str(d.get('phase')))
 print('  outcome:        ' + str(d.get('outcome')))
 print('  duration:       ' + str(d.get('duration_s')) + 's')
 print('  trace_id:       ' + str(d.get('trace_id')))
+print('  model:          ' + str(d.get('model')))
+mw = d.get('model_warning')
+if mw:
+    print('  model_warning:  requested=%s not in available_models=%s (server fell back)' % (mw.get('requested_model'), mw.get('available_models')))
+av = d.get('available_models')
+if av:
+    print('  avail_models:   ' + ','.join(av))
+sp = d.get('system_prompt_mode')
+if sp:
+    print('  sp_mode:        ' + sp)
 u = d.get('usage', {})
 print('  tokens:         prompt=%s completion=%s reasoning=%s cache_hit=%s' % (u.get('prompt_tokens', 0), u.get('completion_tokens', 0), u.get('reasoning_tokens', 0), u.get('cache_read_tokens', 0)))
 c = d.get('context_window', {})
@@ -352,7 +368,7 @@ if [ "$MODE" = "acp" ] && [ "$BG_MODE" = false ]; then
     WORKER_FLAGS+=(--append-system-prompt "$APPEND_SYSTEM_PROMPT")
   fi
   python3 "$SCRIPT_DIR/invoke-codebuddy-acp-worker.py" \
-    "${WORKER_FLAGS[@]}" 2>/dev/null
+    "${WORKER_FLAGS[@]}"
   RC=$?
   T1=$(date +%s); DT=$((T1-T0))
   log_invoke "acp-sync" "n/a" "$HANDLE" "rc=$RC" "$DT" "$TASK"

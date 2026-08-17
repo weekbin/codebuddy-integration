@@ -212,11 +212,17 @@ Use `--mode acp` (the default) when you want the base.
 ## Limitations
 
 - Each call costs ~24k codebuddy input tokens on first invocation (system prompt
-  + tool catalog). On **subsequent calls the system prompt + tool catalog is
-  almost entirely cache-hit** (observed: `cache_read_tokens` ≈ `prompt_tokens`
-  in `--metrics` output), so a 100-call session costs roughly 24k + 99 ×
-  a-few-hundred-tokens rather than 100 × 24k. So long-running sessions are
-  significantly cheaper than the per-call number suggests.
+  + tool catalog).
+- **Cache hit rate is unstable and server-driven** — it is NOT something this
+  plugin can control or predict. Empirically (20-call sample, same prompt):
+  - **75% of calls hit 11%** (server-side public cache, stable baseline)
+  - **5% of calls hit 21%**
+  - **20% of calls hit 99–100%** (rare alignment with a populated server cache slot)
+  - average ≈ 23%
+  In other words: a 100-call session will cost **roughly 70–80× the per-call
+  number, not 1×** (which is what a "subsequent calls are nearly free" reading
+  would imply). Use `--metrics <handle>` on any prior call to see the actual
+  `cache_hit` / `prompt` ratio for your workload.
 - TUI mode captures the first `● ...` segment of codebuddy's reply; very long
   answers are folded. Use `--keep` + `--status` or fall back to `--mode print`
   when you need the full text.

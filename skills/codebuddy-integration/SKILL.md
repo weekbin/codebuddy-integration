@@ -5,7 +5,7 @@ license: MIT
 compatibility: Requires MiniMax Code with Agent Plugins 1.0 support, the `codebuddy` CLI on $PATH (or `CODEBUDDY_BIN` env var pointing at it), and (for `--mode tui` only, otherwise optional) the `orca-ide` CLI.
 metadata:
   author: weekbin
-  version: "0.2.0"
+  version: "0.2.1"
 ---
 
 # codebuddy-integration — codebuddy as a subagent
@@ -194,11 +194,14 @@ so you still get a result. Pass `--mode print` for the cheapest, fastest, no-sid
 ## Cost and safety
 
 - **First call** in a session costs ~24k codebuddy input tokens (mcode base system
-  prompt + codebuddy's tool catalog). On **subsequent calls the system prompt and
-  tool catalog are almost entirely cache-hit** — observed: `cache_read_tokens` ≈
-  `prompt_tokens` in `--metrics` output. So a 100-call session costs roughly
-  24k + 99 × a-few-hundred-tokens rather than 100 × 24k. Long-running sessions
-  are significantly cheaper than the per-call number suggests.
+  prompt + codebuddy's tool catalog).
+- **Cache hit rate is unstable and server-driven** — not something this plugin
+  can control. Empirically (20-call sample, same prompt):
+  - 75% of calls hit 11% (server-side public cache, stable baseline)
+  - 20% of calls hit 99–100% (rare alignment with a populated cache slot)
+  - average ≈ 23%
+  So a 100-call session will cost roughly 70–80× the per-call number, not 1×.
+  Use `--metrics <handle>` to see the actual `cache_hit` / `prompt` ratio.
 - `--mode print` skips the mcode base system prompt, so it is slightly cheaper
   on the first call too (no base-prompt cache slot to populate). Use `--mode
   print` for one-shot smoke tests; use `--mode acp` (default) for production

@@ -4,6 +4,45 @@ All notable changes to this plugin are documented in this file. The format is ba
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-08-17
+
+### Fixed (from full-smoke.sh gap report on 0.2.0)
+
+- **Pre-check `--system-prompt-file` existence** — was: codebuddy silently
+  fell back to its default prompt when the file path didn't exist, so callers
+  thought their system prompt took effect when it didn't. Now: plugin rejects
+  missing file with `rc=2` and a clear error message before the call.
+- **`--model` unknown-id detection** — was: codebuddy silently fell back to
+  its default model when the caller passed an unknown model id; `status.model`
+  still showed the caller-requested value, so callers were deceived. Now:
+  worker checks `available_models` after `session/new` and records
+  `status.model_warning` + writes a `warning: ...` line to stderr + emits a
+  `model_warning` event. Note this is a post-hoc detection (we cannot
+  pre-check without a listModels RPC), so the bad call still happens once —
+  but the warning is loud.
+- **Stderr hygiene in `acp-worker.py`** — was: worker printed internal debug
+  like `[reader] stdout closed` to stderr, mixed with the real warnings.
+  Now: `_log(msg, level)` only writes `warn` / `error` to stderr; debug goes
+  to the events file only. All `failed:` / `error:` prefixes standardized.
+- **Removed `2>/dev/null` on acp-sync worker spawn** — was suppressing the
+  model_warning (and any other future stderr). Now sync-mode stderr reaches
+  the user.
+
+### Documented (gap report correction)
+
+- **Cache hit rate is unstable and server-driven** — previous README claimed
+  "subsequent calls almost entirely cache-hit (cache_read ≈ prompt)". This
+  was misleading. 20-call sample shows: 75% of calls hit 11%, 5% hit 21%,
+  20% hit 99-100%, average ≈ 23%. A 100-call session costs 70-80× per-call,
+  not 1×. README and SKILL.md updated to reflect actual behavior. Use
+  `--metrics <handle>` to see your own hit rate.
+
+### Added
+
+- `tests/full-smoke.sh` — long-task + cache + system-prompt + error
+  + state + bridge + install-sh smoke tests, 28 cases. Requires a real
+  `codebuddy` login (burns ~150-200k tokens, mostly cache hits).
+
 ## [0.2.0] - 2026-08-17
 
 ### Added

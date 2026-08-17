@@ -167,11 +167,12 @@ class Worker(ACPClient):
         }
         super().__init__(proc, log=self._log)
 
-    def _log(self, msg):
-        # Tee to stderr + events file
-        sys.stderr.write(msg + "\n")
-        sys.stderr.flush()
-        append_event(self.events_file, {"kind": "log", "msg": msg})
+    def _log(self, msg, level="debug"):
+        # user-facing (warn/error) → stderr; debug → events file only
+        if level in ("warn", "error"):
+            sys.stderr.write(msg + "\n")
+            sys.stderr.flush()
+        append_event(self.events_file, {"kind": "log", "level": level, "msg": msg})
 
     def _on_notification(self, msg: dict) -> None:
         method = msg.get("method")
@@ -308,7 +309,7 @@ def run(task: str, model: str | None, events_file: Path, status_file: Path,
             stderr=subprocess.DEVNULL, bufsize=0,
         )
     except Exception as e:
-        sys.stderr.write(f"failed to spawn codebuddy: {e}\n")
+        sys.stderr.write(f"error: failed to spawn codebuddy: {e}\n")
         return 3
 
     w = Worker(proc, events_file, status_file, task)
@@ -323,7 +324,7 @@ def run(task: str, model: str | None, events_file: Path, status_file: Path,
             "capabilities": {},
         }, timeout=15)
     except Exception as e:
-        sys.stderr.write(f"initialize failed: {e}\n")
+        sys.stderr.write(f"error: initialize failed: {e}\n")
         proc.terminate()
         return 4
 
@@ -339,7 +340,7 @@ def run(task: str, model: str | None, events_file: Path, status_file: Path,
     try:
         r = w.call("session/new", session_new_params, timeout=30)
     except Exception as e:
-        sys.stderr.write(f"session/new failed: {e}\n")
+        sys.stderr.write(f"error: session/new failed: {e}\n")
         proc.terminate()
         return 4
     w.status["session_id"] = r.get("sessionId")
@@ -347,6 +348,27 @@ def run(task: str, model: str | None, events_file: Path, status_file: Path,
     w.status["phase"] = "ready"
     w._persist()
     append_event(events_file, {"kind": "session_new", "session_id": w.status["session_id"]})
+
+    # GAP-3: 如果 user 显式传了 model 但它不在 server 返回的 available_models 里,
+    # 记下 warning(codebuddy 收到 unknown model id 时会 silently fall back 到 default,
+    # 而 status.model 字段还是 user 传的值,user 完全感知不到)。
+    # 我们没办法在 session/new 之前预检(只有 session/new 才返回 available_models),
+    # 只能在事后提醒;但有这次记录后,user 在 --metrics 看到 warning + available_models,
+    # 下次就知道该选哪个。
+    if model is not None and w.status["available_models"] and model not in w.status["available_models"]:
+        warning = {
+            "requested_model": model,
+            "available_models": w.status["available_models"],
+            "note": "codebuddy server fell back to a default model; the requested one is unknown to your account",
+        }
+        w.status["model_warning"] = warning
+        sys.stderr.write(
+            f"warning: --model {model!r} not in available_models; "
+            f"server fell back to its default. available: {w.status['available_models']}\n"
+        )
+        # already in events; stderr 上面已经写
+        append_event(events_file, {"kind": "model_warning", **warning})
+        w._persist()
 
     # 3) session/prompt
     w.status["phase"] = "preparing"
@@ -357,7 +379,7 @@ def run(task: str, model: str | None, events_file: Path, status_file: Path,
             "prompt": [{"type": "text", "text": task}],
         }, timeout=timeout)
     except Exception as e:
-        sys.stderr.write(f"prompt failed: {e}\n")
+        sys.stderr.write(f"error: prompt failed: {e}\n")
         w.status["outcome"] = "error"
         w.status["phase"] = "error"
         w.status["finished_at"] = time.time()
