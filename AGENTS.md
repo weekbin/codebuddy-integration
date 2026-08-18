@@ -11,7 +11,7 @@ client) that exposes `codebuddy` as 5 MCP tools. mcode loads
 `mcp.json` on session start; the wrapper keeps one
 `codebuddy --acp` subprocess alive for the session.
 
-Version: 0.3.10. Status: stable, in production use.
+Version: 0.3.11. Status: stable, in production use.
 
 ## File layout (what matters)
 
@@ -96,9 +96,7 @@ A full local index of spec facts is in agent memory
   it on `mcode install`.
 - Don't write to `~/.minimax/mcp/mcp.json` — spec 1.0.0 puts MCP
   config in the plugin's own `mcp.json`, not a global location.
-- Don't reintroduce `bin/install.sh`, `bin/invoke-codebuddy*`, or
-  `tests/smoke.sh` — removed in 0.3.0 because the MCP path makes
-  them dead code. See CHANGELOG 0.3.0 "Removed" section.
+- No install hook, no symlink, no PATH mutation, no global config files. mcode auto-loads plugins per Agent Plugins 1.0.0 spec.
 - Don't commit `state/`, `logs/`, `__pycache__/`, or `.DS_Store` —
   they're in `.gitignore` for a reason.
 

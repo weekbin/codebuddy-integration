@@ -3,7 +3,7 @@
 > 给 mcode 增加一个调用 codebuddy 的入口，处理翻译、长文摘要、寻求不同意见、
 > 换思路重写代码这类纯文字任务。通过 stdio MCP 维持一个长生命周期的
 > `codebuddy --acp` 子进程，首次调用预热后缓存命中率稳定 99% 左右。
-> 版本 0.3.10。
+> 版本 0.3.11。
 
 ## MCP 工具
 
@@ -100,8 +100,7 @@ MCP server，mcode 启动时读取并 spawn wrapper。
   后续 `prompt_tokens` prefix 复用率稳定 99%（实测见上节）。每个调用方（worker / 主 agent）
   拿到自己的 `acp_session_id`，互不污染。
 - **mcp 2.x `Server` API**：wrapper 用 v2 的 `Server(name, on_list_tools=fn, on_call_tool=fn)`
-  构造 callback 方式注册 handler。`mcp>=2.0.0,<3` 是硬依赖（v1.x 已 EOL，
-  装饰器 API 跟 v2 不兼容）。
+  构造 callback 方式注册 handler。`mcp>=2.0.0,<3` 是硬依赖。
 - **fail-fast 启动**：`get_session()` 第一次被调时先跑 `codebuddy --version`（5s 超时），
   缺二进制、退出非 0、或 hang 都给清晰报错，不会延后到第一次 prompt 才发现。约多花
   0.5-1s 启动延迟，换来错误信息明确。
@@ -118,7 +117,7 @@ MCP server，mcode 启动时读取并 spawn wrapper。
    ```bash
    pip install --upgrade 'mcp>=2.0.0,<3'
    ```
-   （`codebuddy-integration` 0.3.7+ 强制要求 v2；v1.27.1 之类的旧版会 `TypeError`）
+   （需要 mcp v2.x）
 3. **确认 `pip` 装到的是 wrapper 用的同一个 `python3`** — wrapper 的 shebang 是
    `#!/usr/bin/env python3`，由 PATH 第一个 `python3` 解析决定。多 python 共存时
    （macOS homebrew 装 3.14 + 系统自带的 3.9 / 3.10 等）很常见踩坑：装到 A python，
@@ -138,7 +137,7 @@ mcode 从声明位置自动加载。
 
 - mcode（支持 Agent Plugins 1.0.0）
 - `codebuddy` CLI（`$PATH` 或 `CODEBUDDY_BIN` 环境变量）
-- Python 3.10+ 及 **`mcp>=2.0.0,<3`** Python 包（v1.x 是 EOL，跟本 wrapper 不兼容）
+- Python 3.10+ 及 **`mcp>=2.0.0,<3`** Python 包
 - `python3` 在 PATH（wrapper 和 JSON 解析用）
 
 ## 数据与网络
@@ -178,7 +177,7 @@ python3 tests/mcp-long-prompt-test.py
 - 默认 `model` 是服务端默认（hy3，x0.00 credits 免费档），可能因账号频率限制 429
   拒答。生产用建议显式传 `model="deepseek-v4-flash"`（0.08 credits）。
 - MCP 协议是 stdio-only（spec 1.0.0 也支持 `streamable-http`，但本 plugin 0.4.0 才考虑）。
-- `mcp` 包 v1.x 装本插件会 `TypeError` 启动失败。固定 v2。
+- 需要 mcp v2.x（`mcp>=2.0.0,<3`）。
 
 ## 规范符合
 

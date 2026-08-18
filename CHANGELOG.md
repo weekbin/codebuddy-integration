@@ -4,6 +4,20 @@ All notable changes to this plugin are documented in this file. The format is ba
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.11] - 2026-08-18
+
+### Changed
+- **Stripped every reference to deprecated / removed / EOL content from forward-looking docs** (README, SKILL.md, AGENTS.md, plugin.json, mcp.json, wrapper code comments). The plugin's current surface is the only thing these documents should describe; history of what was deleted, what version a bug was fixed in, what the old default was, etc. belongs in CHANGELOG only. Specifically:
+  - `README.md` install step 2: `（codebuddy-integration 0.3.7+ 强制要求 v2；v1.27.1 之类的旧版会 TypeError）` → `（需要 mcp v2.x）`. No internal-error detail, no specific old version number.
+  - `README.md` 工作原理 "mcp 2.x Server API" 段: dropped the trailing `（v1.x 已 EOL，装饰器 API 跟 v2 不兼容）` parenthetical. The current v2 API shape stands on its own.
+  - `README.md` 依赖 row: `Python 3.10+ 及 mcp>=2.0.0,<3 Python 包（v1.x 是 EOL，跟本 wrapper 不兼容）` → `Python 3.10+ 及 mcp>=2.0.0,<3 Python 包`.
+  - `README.md` 限制 last row: `mcp 包 v1.x 装本插件会 TypeError 启动失败。固定 v2。` → `需要 mcp v2.x（mcp>=2.0.0,<3）。`.
+  - `AGENTS.md` "Things explicitly NOT to do" row: `Don't reintroduce bin/install.sh, bin/invoke-codebuddy*, or tests/smoke.sh — removed in 0.3.0 because the MCP path makes them dead code. See CHANGELOG 0.3.0 "Removed" section.` → `No install hook, no symlink, no PATH mutation, no global config files. mcode auto-loads plugins per Agent Plugins 1.0.0 spec.`. Category-level guidance, no specific removed-script names, no version-pinned "see CHANGELOG X" reference.
+  - `SKILL.md` frontmatter `compatibility`: dropped the parenthetical `(v1.x is EOL and the wrapper targets v2's Server(name, on_list_tools=fn, on_call_tool=fn) constructor-callback API)`. Current requirement is just "Python 3.10+ with the mcp>=2.0.0,<3 package" — no v1.x reference, no internal API-shape leak (code is the ground truth for that).
+
+### Kept
+- `CHANGELOG.md` 0.3.0 / 0.3.5 / 0.3.7 / 0.3.9 entries still mention `bin/install.sh`, `bin/invoke-codebuddy*`, `tests/smoke.sh`, `tests/mcp-set-model-probe-test.py`, `tests/mcp-traffic-capture-test.py`, mcp v1.27.1, the `TypeError: Server.__init__() got an unexpected keyword argument 'on_list_tools'` symptom, etc. Those are keep-a-changelog "Removed" / "Fixed" records — the changelog's job is to be the history log. They stay.
+
 ## [0.3.10] - 2026-08-18
 
 ### Changed
