@@ -4,6 +4,21 @@ All notable changes to this plugin are documented in this file. The format is ba
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.9] - 2026-08-18
+
+### Fixed
+- **`list_models` tool description was stale**: it claimed to "parse `codebuddy --help`", but 0.3.3+ reads from the live ACP session's `models.availableModels` (rich path: per-model credits / maxInputTokens / supportsReasoning). The `--help` parser is a fallback for the no-session case, almost never hit. Reworded to reflect the actual primary path; agents reading the schema will no longer form the wrong mental model of what `list_models` does.
+- **AGENTS.md number drift**: `Version: 0.3.6` was two versions behind (actual 0.3.8 at the time, 0.3.9 with this release); `wrapper ~685 lines` was off by 66 (actual 751). Both are now aligned.
+
+### Changed
+- **SKILL.md: explicit "don't pass a short `timeout=`" rule** with the underlying reason. Verified in this release: a 113K-token `deepseek-v4-flash` review prompt finished in 157.49s on the wrapper side (`call_count` and credits charged), but a worker-side `timeout=180` made the mcp client give up at the same moment and the response was lost to `MCP error -32001: Request timed out`. The wrapper's default `prompt.timeout=3600` (1h) is the right ceiling — 300s is not enough for genuinely long tasks (multi-thousand-line code-context review, large doc summary). Leave `timeout` unset for any task that could plausibly take more than a minute; if you need a hard deadline, set it to ≥ 600s. Worker template at the end of SKILL.md already omits `timeout=`, so no template change needed — just the rule.
+- **Wrapper default `prompt.timeout` raised 300 → 3600s (1h)**: 300s is too tight for long-form tasks even at the wrapper level. 3600s is a generous ceiling that effectively never fires for any real codebuddy prompt (observed max 157s so far), but bounds the worst case if the codebuddy subprocess genuinely hangs. The mcp client side, not us, is the place to bound user-visible latency — the wrapper just shouldn't cap it artificially.
+- **SKILL.md frontmatter `compatibility`**: added the python-interpreter footgun ("`mcp` package must be installed into the same `python3` the wrapper's shebang resolves at runtime, otherwise `ModuleNotFoundError` at startup and the plugin loads zero tools").
+- **README "安装" step 3**: explicit `which python3` + `python3 -c "import mcp"` verification, plus the multi-python coexistence case (macOS homebrew 3.14 + system 3.9/3.10 etc.) and the explicit re-install command when they don't match.
+
+### Kept
+- Worker-template default pattern from 0.3.8 (worker → mcp, no `timeout=` arg). Same as before, just now documented why the omission is load-bearing.
+
 ## [0.3.8] - 2026-08-18
 
 ### Changed

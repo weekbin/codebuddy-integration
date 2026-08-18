@@ -12,7 +12,7 @@ wrapper 维持一个长生命周期的 `codebuddy --acp` 子进程，暴露 5 �
 
 | Tool | 用途 | 关键参数 |
 |------|------|----------|
-| `prompt(text, ...)` | 一次性文本 prompt | `model?` 选模型；`append_system_prompt?` 拼业务规则（触发子进程 respawn）；`include_thinking?` 暴露推理痕迹；`timeout?` 默认 300s |
+| `prompt(text, ...)` | 一次性文本 prompt | `model?` 选模型；`append_system_prompt?` 拼业务规则（触发子进程 respawn）；`include_thinking?` 暴露推理痕迹；`timeout?` 默认 3600s（1h，真正长任务也不卡） |
 | `continue(text, ...)` | 同一 codebuddy 会话追问，复用 `sessionId`，不重启子进程 | 同 `prompt` 参数 |
 | `status()` | wrapper + codebuddy 状态（pid、acp_session_id、model、uptime、call_count、最后 cache_ratio、累计 token） | 无 |
 | `list_tasks(limit?)` | 最近 N 次调用的元数据（最新优先），每条含 model/dur/prompt_tokens/completion_tokens/cached_tokens/cache_ratio/stop_reason | `limit` 默认 10，clamp 到 50 |
@@ -132,7 +132,17 @@ MCP server，mcode 启动时读取并 spawn wrapper。
    pip install --upgrade 'mcp>=2.0.0,<3'
    ```
    （`codebuddy-integration` 0.3.7+ 强制要求 v2；v1.27.1 之类的旧版会 `TypeError`）
-3. 通过 mcode plugin manager 装本插件。mcode 启动时读 `mcp.json`，不需要全局 install hook。
+3. **确认 `pip` 装到的是 wrapper 用的同一个 `python3`** — wrapper 的 shebang 是
+   `#!/usr/bin/env python3`，由 PATH 第一个 `python3` 解析决定。多 python 共存时
+   （macOS homebrew 装 3.14 + 系统自带的 3.9 / 3.10 等）很常见踩坑：装到 A python，
+   wrapper 跑的是 B python → 启动直接 `ModuleNotFoundError: No module named 'mcp'`，
+   整个 plugin 加载成 0 工具。检查：
+   ```bash
+   which python3                                  # PATH 第一个
+   python3 -c "import mcp; print(mcp.__file__)"   # 它有 mcp 吗
+   ```
+   不匹配时显式装到目标 python：`/path/to/the/right/python3 -m pip install 'mcp>=2.0.0,<3'`。
+4. 通过 mcode plugin manager 装本插件。mcode 启动时读 `mcp.json`，不需要全局 install hook。
 
 没有 `install.sh` 要跑，没有 symlink 要建，没有 PATH 要改。插件符合 spec 1.0.0，
 mcode 从声明位置自动加载。

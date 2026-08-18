@@ -109,7 +109,7 @@ def _fmt(v) -> str:
 class ACPSession:
     def __init__(self, codebuddy_bin: str, cwd: str,
                  mcode_base_prompt_file: Optional[str] = None,
-                 timeout: int = 300):
+                 timeout: int = 3600):
         self.codebuddy_bin = codebuddy_bin
         self.cwd = cwd
         self.mcode_base_prompt_file = mcode_base_prompt_file
@@ -668,7 +668,7 @@ TOOL_LIST_TASKS = Tool(
 )
 TOOL_LIST_MODELS = Tool(
     name="list_models",
-    description=("List codebuddy's supported model IDs by parsing `codebuddy --help`. Use this before passing a `model` argument to `prompt` / `continue` to verify the model id is valid (e.g. `deepseek-v4-flash`, `hy3`). Returns `{ok, models: [id, ...], count, source}` on success, `{ok: false, error, ...}` on failure. Cached per process."),
+    description=("List codebuddy's supported model IDs. Reads from the live ACP session's `models.availableModels` (rich: per-model credits / maxInputTokens / supportsReasoning — what 0.3.3+ ships); falls back to parsing `codebuddy --help` only if no session is live yet. Use this before passing a `model=` argument to `prompt` / `continue` to verify the model id is valid (e.g. `deepseek-v4-flash`, `hy3`). Returns `{ok, models: [id, ...], count, source}` plus a `rich` array with per-model metadata on success; `{ok: false, error, ...}` on failure. Cached per process."),
     inputSchema={"type": "object", "properties": {}, "additionalProperties": False},
 )
 

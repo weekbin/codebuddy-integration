@@ -11,7 +11,7 @@ client) that exposes `codebuddy` as 5 MCP tools. mcode loads
 `mcp.json` on session start; the wrapper keeps one
 `codebuddy --acp` subprocess alive for the session.
 
-Version: 0.3.6. Status: stable, in production use.
+Version: 0.3.9. Status: stable, in production use.
 
 ## File layout (what matters)
 
@@ -20,7 +20,7 @@ Version: 0.3.6. Status: stable, in production use.
 | `plugin.json` | spec manifest (10 top-level fields, closed schema) | Bumping version, changing name/description/keywords |
 | `mcp.json` | spec MCP config (fixed at plugin root per spec §7.2.1) | Changing server name, command, env, or cwd |
 | `skills/codebuddy-integration/SKILL.md` | Agent Skills spec file (loaded by mcode as a skill) | Changing when/why mcode should call codebuddy; tool description, trigger phrases, decision tree |
-| `bin/codebuddy-mcp-server.py` | The stdio MCP wrapper (~685 lines, one long-lived subprocess) | Adding tools, changing ACP protocol handling, changing log format |
+| `bin/codebuddy-mcp-server.py` | The stdio MCP wrapper (~751 lines, one long-lived subprocess) | Adding tools, changing ACP protocol handling, changing log format |
 | `assets/mcode-base-system-prompt.md` | Base system prompt injected into every codebuddy call | Changing mcode's identity/role/boundary for codebuddy |
 | `tests/mcp-poc-test.py` | 5-call cold→warm cache smoke | After changing cache behavior |
 | `tests/mcp-features-test.py` | 5-tool end-to-end (status, list_tasks, list_models, prompt, continue, model, append respawn, thinking) | After adding/changing tools |

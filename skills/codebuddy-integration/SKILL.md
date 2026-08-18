@@ -2,10 +2,10 @@
 name: codebuddy-integration
 description: "Delegate a text-reasoning subtask to codebuddy (a peer LLM) via 5 MCP tools. Use for translate / summarize / review / brainstorm / second opinion. Burns codebuddy credits, not mcode tokens. Triggers: '用 codebuddy', '让 codebuddy', 'ask codebuddy'."
 license: MIT
-compatibility: Requires MiniMax Code with Agent Plugins 1.0.0+ support, the `codebuddy` CLI on $PATH (or `CODEBUDDY_BIN` env var), Python 3.10+ with the `mcp>=2.0.0,<3` package (v1.x is EOL and the wrapper targets v2's `Server(name, on_list_tools=fn, on_call_tool=fn)` constructor-callback API).
+compatibility: Requires MiniMax Code with Agent Plugins 1.0.0+ support, the `codebuddy` CLI on $PATH (or `CODEBUDDY_BIN` env var), Python 3.10+ with the `mcp>=2.0.0,<3` package (v1.x is EOL and the wrapper targets v2's `Server(name, on_list_tools=fn, on_call_tool=fn)` constructor-callback API). Install the `mcp` package into the **same** `python3` the wrapper resolves at runtime (its shebang `#!/usr/bin/env python3`) — otherwise startup fails with `ModuleNotFoundError: No module named 'mcp'` and the plugin loads zero tools.
 metadata:
   author: weekbin
-  version: "0.3.8"
+  version: "0.3.9"
 ---
 
 # codebuddy-integration
@@ -44,6 +44,7 @@ With `include_thinking=true`, also a `--- thinking (N chars) ---` section before
 - **`model=` switch is dynamic**: changing `model=` mid-session uses `session/set_config_option` (preserves `sessionId`, cache, and turn history). No subprocess restart. Call `list_models()` first to confirm the id is supported.
 - **`append_system_prompt` change** respawns the subprocess and drops cache to cold. Set it once per session, not per call.
 - **`include_thinking=true`** exposes the model's reasoning trace. Off by default — a long task can produce hundreds of thought chunks. Set per-call, not per-session.
+- **Don't pass a short `timeout=` to `mcp__codebuddy__prompt` / `mcp__codebuddy__continue`**: a real long prompt (full-doc review, large code-context summary, ~100K+ input tokens) routinely runs 100-160s end-to-end, and 3600s is a more honest ceiling for the genuinely long ones (multi-thousand-line code-context review, large doc summary). Passing `timeout=120` or similar to "bound latency" only makes the mcp client give up *while codebuddy is still finishing*: the wrapper's `call_count` still goes up and credits are still charged, but the client receives `MCP error -32001: Request timed out` and the response is lost (confirmed: a 113K-token review prompt finished in 157.49s, but a 180s worker-side timeout dropped the response with the credits already spent). Leave `timeout` unset (= wrapper's 3600s default) for any task that could plausibly take more than a minute; if you genuinely need a hard deadline, set it to ≥ 600s.
 - **`(no message received from codebuddy)` + `stop=refusal` + 0 tokens** = the model returned no `message` field. For the free-tier default `hy3` (x0.00 credits), this is typically a rate limit 429; check `codebuddy models` outside the wrapper for the reset time. Workaround: pass `model="deepseek-v4-flash"` (0.08 credits) or any other paid-tier model.
 - **Failed prompts stay in the acp session history**: a `stop=refusal` does not clear the prompt. The next model you switch to will see the full history including refused prompts.
 
