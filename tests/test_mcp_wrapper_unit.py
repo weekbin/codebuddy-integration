@@ -701,33 +701,53 @@ class TestGetResult(unittest.TestCase):
 
 
 class TestGlobalTimeoutDefaults(unittest.TestCase):
-    """v4 invariant: every timeout default = 3600 (1h). grep-able
-    guard so a future change can't quietly regress to 60/300/600."""
+    """v4 invariant: ACPSession.timeout default = 3600 (1h). grep-able
+    guard so a future change can't quietly regress to 60/300/600.
+
+    0.4.1: get_result is poll-only and its wait_timeout_s default is 0
+    (no wait — always instant). The 1h convention is preserved via
+    the inputSchema default for `run` (and the ACPSession internal
+    timeout); get_result's wait_timeout_s is now a no-op parameter
+    kept for API compatibility.
+    """
 
     def test_acp_session_default_timeout(self):
-        # The default value of `timeout` in the ACPSession signature is
-        # 3600. We assert it via signature inspection rather than running
-        # __init__ (which spawns a subprocess).
         import inspect
         sig = inspect.signature(_mod.ACPSession.__init__)
         self.assertEqual(sig.parameters["timeout"].default, 3600)
 
-    def test_get_result_default_wait_timeout(self):
+    def test_get_result_default_wait_timeout_is_zero(self):
+        # 0.4.1: get_result is now always poll-mode (instant return).
+        # wait_timeout_s is accepted but ignored; its default is 0 to
+        # signal "no wait" to any caller reading the signature.
         import inspect
         sig = inspect.signature(_mod.ACPSession.get_result)
-        self.assertEqual(sig.parameters["wait_timeout_s"].default, 3600)
+        self.assertEqual(sig.parameters["wait_timeout_s"].default, 0)
 
-    def test_input_schemas_use_3600(self):
-        # Both get_result and run expose wait_timeout_s default in their
-        # input_schema (read by the MCP client at tools/list time). mcp v2
-        # uses pydantic which exposes it as `input_schema` (snake_case).
+    def test_get_result_default_mode_is_poll(self):
+        # 0.4.1: get_result no longer supports `mode="blocking"`. The
+        # default is now "poll". Passing "blocking" raises ValueError.
+        import inspect
+        sig = inspect.signature(_mod.ACPSession.get_result)
+        self.assertEqual(sig.parameters["mode"].default, "poll")
+
+    def test_input_schemas_use_3600_for_run(self):
+        # Only the `run` tool (the convenience wrapper that blocks the
+        # MCP request for the call duration) exposes wait_timeout_s with
+        # a 1h default. get_result's wait_timeout_s is 0 (no wait,
+        # instant return).
         for tool in _mod.ALL_TOOLS:
             schema = tool.input_schema
             props = schema.get("properties", {})
-            if "wait_timeout_s" in props:
+            if "wait_timeout_s" in props and tool.name == "run":
                 self.assertEqual(
                     props["wait_timeout_s"].get("default"), 3600,
                     f"{tool.name}.input_schema.wait_timeout_s.default must be 3600, got {props['wait_timeout_s'].get('default')!r}",
+                )
+            if "wait_timeout_s" in props and tool.name == "get_result":
+                self.assertEqual(
+                    props["wait_timeout_s"].get("default"), 0,
+                    f"{tool.name}.input_schema.wait_timeout_s.default must be 0 (poll-mode), got {props['wait_timeout_s'].get('default')!r}",
                 )
 
     def test_legacy_prompt_tool_not_in_all_tools(self):
@@ -735,15 +755,146 @@ class TestGlobalTimeoutDefaults(unittest.TestCase):
         self.assertNotIn("prompt", names)
         self.assertNotIn("continue", names)
 
-    def test_seven_tools_total(self):
-        self.assertEqual(len(_mod.ALL_TOOLS), 7)
+    def test_eight_tools_total(self):
+        # 0.4.1: added cancel_task → 8 tools.
+        self.assertEqual(len(_mod.ALL_TOOLS), 8)
 
     def test_expected_tool_set(self):
         names = {t.name for t in _mod.ALL_TOOLS}
         self.assertEqual(names, {
             "submit_prompt", "submit_continue", "get_result", "run",
-            "status", "list_tasks", "list_models",
+            "cancel_task", "status", "list_tasks", "list_models",
         })
+
+
+class TestCancelTask(unittest.TestCase):
+    """0.4.1: cancel_task frees the wrapper when an in-flight task hangs."""
+
+    def _build_sess(self, *, inflight=None, done=None, disk=None):
+        sess = _mod.ACPSession.__new__(_mod.ACPSession)
+        sess._inflight = inflight
+        sess._tasks_done = deque(done or [], maxlen=50)
+        sess._task_event = threading.Event()
+        sess._task_lock = threading.Lock()
+        sess.last_model = "hy3"
+        return sess
+
+    def test_cancel_inflight_task(self):
+        import unittest.mock as mock
+        rec = _mod.TaskRecord(
+            task_id="tsk_cancel1234ab", status="running",
+            submitted_at="2026-08-18T10:00:00+00:00", model="deepseek-v4-flash",
+        )
+        sess = self._build_sess(inflight=rec)
+        with mock.patch.object(_mod, "_save_task", return_value=True):
+            out = sess.cancel_task("tsk_cancel1234ab")
+        self.assertEqual(out["status"], "cancelled")
+        # Inflight is cleared
+        self.assertIsNone(sess._inflight)
+        # Record is marked cancelled
+        self.assertEqual(rec.status, "cancelled")
+        self.assertEqual(rec.error, "cancelled by user")
+
+    def test_cancel_done_task(self):
+        rec = _mod.TaskRecord(
+            task_id="tsk_done1234ab", status="done",
+            submitted_at="2026-08-18T10:00:00+00:00",
+            result={"text": "y"},
+        )
+        sess = self._build_sess(done=[rec])
+        out = sess.cancel_task("tsk_done1234ab")
+        self.assertEqual(out["status"], "cancelled")
+        self.assertEqual(rec.status, "cancelled")
+
+    def test_cancel_unknown_task_id(self):
+        import unittest.mock as mock
+        sess = self._build_sess()
+        with mock.patch.object(_mod, "_load_task", return_value=None):
+            out = sess.cancel_task("tsk_unknown12345")
+        self.assertEqual(out["status"], "unknown")
+        self.assertIn("no such task_id", out["error"])
+
+    def test_cancel_from_disk(self):
+        # Wrapper-restart case: in-memory state is empty, task only on disk.
+        import unittest.mock as mock
+        disk_rec = _mod.TaskRecord(
+            task_id="tsk_disk1234ab", status="done",
+            submitted_at="2026-08-18T10:00:00+00:00",
+        )
+        sess = self._build_sess()
+        with mock.patch.object(_mod, "_load_task", return_value=disk_rec), \
+             mock.patch.object(_mod, "_save_task", return_value=True):
+            out = sess.cancel_task("tsk_disk1234ab")
+        self.assertEqual(out["status"], "cancelled")
+        self.assertEqual(disk_rec.status, "cancelled")
+
+
+class TestGetResultPollOnly(unittest.TestCase):
+    """0.4.1: get_result blocking mode is removed. Only `mode='poll'`
+    is accepted; passing `mode='blocking'` raises ValueError with a
+    clear migration message."""
+
+    def _build_sess(self, *, inflight=None, done=None):
+        sess = _mod.ACPSession.__new__(_mod.ACPSession)
+        sess._inflight = inflight
+        sess._tasks_done = deque(done or [], maxlen=50)
+        sess._task_event = threading.Event()
+        sess._task_lock = threading.Lock()
+        sess.last_model = "hy3"
+        return sess
+
+    def test_blocking_mode_raises(self):
+        sess = self._build_sess()
+        with self.assertRaises(ValueError) as ctx:
+            sess.get_result("tsk_anything1234", mode="blocking")
+        self.assertIn("blocking mode was removed", str(ctx.exception))
+        self.assertIn("0.4.1", str(ctx.exception))
+
+    def test_unknown_mode_raises(self):
+        sess = self._build_sess()
+        with self.assertRaises(ValueError) as ctx:
+            sess.get_result("tsk_anything1234", mode="bogus")
+        self.assertIn("invalid mode", str(ctx.exception))
+
+    def test_poll_inflight_returns_running(self):
+        rec = _mod.TaskRecord(
+            task_id="tsk_poll1234567", status="running",
+            submitted_at="2026-08-18T10:00:00+00:00", model="deepseek-v4-flash",
+        )
+        sess = self._build_sess(inflight=rec)
+        out = sess.get_result("tsk_poll1234567", mode="poll")
+        self.assertEqual(out["status"], "running")
+        self.assertEqual(out["model"], "deepseek-v4-flash")
+        self.assertIn("elapsed_s", out)
+
+
+class TestStatusModelFallback(unittest.TestCase):
+    """0.4.1 (Gap 4): status().model falls back to inflight.model when
+    no completed call has populated last_model yet."""
+
+    def test_falls_back_to_inflight_model(self):
+        sess = _mod.ACPSession.__new__(_mod.ACPSession)
+        sess.last_model = None  # no completed call yet
+        inflight = _mod.TaskRecord(
+            task_id="tsk_fallback1", status="running",
+            submitted_at="2026-08-18T10:00:00+00:00", model="deepseek-v4-flash",
+        )
+        sess._inflight = inflight
+        sess._tasks_done = deque(maxlen=50)
+        sess._task_event = threading.Event()
+        sess._task_lock = threading.Lock()
+        sess.session_id = "sess-1"
+        sess.started_at = time.time() - 60
+        sess.call_count = 0
+        sess.last_call_at = None
+        sess.last_cache_ratio = None
+        sess.totals = {"prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0}
+        sess.proc = type("P", (), {"poll": staticmethod(lambda: None)})()
+        sess.pid = 100
+        st = sess.status()
+        self.assertEqual(st["model"], "deepseek-v4-flash")
+        # inflight_model field is also exposed
+        self.assertEqual(st["inflight_model"], "deepseek-v4-flash")
 
 
 def asyncio_run(coro):

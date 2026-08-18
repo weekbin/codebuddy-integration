@@ -3,21 +3,22 @@
 > 给 mcode 增加一个调用 codebuddy 的入口，处理翻译、长文摘要、寻求不同意见、
 > 换思路重写代码这类纯文字任务。通过 stdio MCP 维持一个长生命周期的
 > `codebuddy --acp` 子进程，首次调用预热后缓存命中率稳定 99% 左右。
-> 版本 0.4.0。
+> 版本 0.4.1。
 
 ## MCP 工具
 
 mcode 启动时通过 `<plugin>/mcp.json` 自动 spawn `bin/codebuddy-mcp-server.py`，
-wrapper 维持一个长生命周期的 `codebuddy --acp` 子进程，暴露 7 个 tool
-（`run` 是便利 wrapper，把 `submit_prompt` + `get_result` 合在一起）：
+wrapper 维持一个长生命周期的 `codebuddy --acp` 子进程，暴露 8 个 tool
+（`run` 是便利 wrapper，把 `submit_prompt` + 短轮询 get_result 合在一起）：
 
 | Tool | 用途 | 关键参数 |
 |------|------|----------|
 | `submit_prompt(text, ...)` | 提交 codebuddy 调用，立即返回 `{task_id, status, submitted_at}`；实际调用在后台线程跑 | `model?` 选模型；`append_system_prompt?` 拼业务规则（触发子进程 respawn）；`include_thinking?` 暴露推理痕迹 |
 | `submit_continue(text, ...)` | 同一 codebuddy 会话追问（复用 `sessionId`），立即返回 task_id | 同 `submit_prompt` 参数 |
-| `get_result(task_id, ...)` | 取已提交 task 的结果 | `wait_timeout_s?` 默认 3600（1h）；`mode="blocking"\|"poll"` |
-| `run(text, ...)` | 便利：submit + blocking get_result，单调用拿结果。worker 模板首选 | `model?` 同上；`wait_timeout_s?` 默认 3600 |
-| `status()` | wrapper + codebuddy 状态（pid、acp_session_id、model、uptime、call_count、最后 cache_ratio、累计 token、`inflight_task_id`） | 无 |
+| `get_result(task_id)` | 取已提交 task 的当前状态。**仅 poll 模式**（毫秒级返回，调用方自行循环 poll）。`mode="blocking"` 会抛 ValueError | `wait_timeout_s?` ignored（保留向后兼容，默认 0） |
+| `run(text, ...)` | 便利：submit + 内部短轮询循环（≤30s），单调用拿结果。worker 模板首选 | `model?` 同上；`wait_timeout_s?` 默认 3600（MCP 请求本身 ≤30s） |
+| `cancel_task(task_id)` | 取消 in-flight 或最近 task。codebuddy 卡住时用它解锁 wrapper | `task_id` 必填 |
+| `status()` | wrapper + codebuddy 状态（pid、acp_session_id、model、uptime、call_count、最后 cache_ratio、累计 token、`inflight_task_id`、`inflight_model`） | 无 |
 | `list_tasks(limit?)` | 最近 N 次调用的元数据（最新优先）+ 当前 in-flight task | `limit` 默认 10，clamp 到 50 |
 | `list_models()` | 列出可用 model id + credits / maxInputTokens / supportsReasoning | 无 |
 

@@ -616,14 +616,20 @@ class ACPSession:
         """Background worker: runs the actual codebuddy session/prompt,
         collects streaming chunks, persists the result. Mutates self state
         under _task_lock and the codebuddy JSON-RPC state under _lock.
+
+        Cancellation: cancel_task(task_id) clears _inflight and marks the
+        record as cancelled. When this thread finishes, it checks whether
+        it's still the active in-flight task; if not, it persists the
+        result to disk with status='cancelled' (NOT 'done') and does NOT
+        touch _inflight or _tasks_done — a new in-flight task is already
+        in flight and must not be overwritten.
         """
-        # We must hold a reference to the inflight record — re-fetch from
-        # _inflight is the cleanest way (it can't change because we
-        # rejected new submits while it's set).
+        # Snapshot our own record at the start. If we get cancelled, the
+        # wrapper's _inflight will be replaced by a new task (or None);
+        # we never touch fields we don't own.
         with self._task_lock:
             rec = self._inflight
             if rec is None or rec.task_id != task_id:
-                # Should never happen: only this thread clears _inflight.
                 return
         t0 = time.time()
         try:
@@ -656,134 +662,188 @@ class ACPSession:
             )
             result["duration_s"] = round(duration, 2)
             result["cb_pid"] = self.pid
-            # Update session-level stats under _task_lock so list_tasks
-            # and status see a consistent snapshot.
+            # Update session-level stats and finalize record under _task_lock.
             with self._task_lock:
+                # Cancellation check: are we still the active in-flight task?
+                was_cancelled = (self._inflight is not rec)
                 used = result.get("model") or self.last_model
-                if used:
+                if used and not was_cancelled:
                     self.last_model = used
                 self.call_count += 1
                 self.last_call_at = t0
                 cache_pct = result["cache_ratio"]
-                self.last_cache_ratio = cache_pct
+                if not was_cancelled:
+                    self.last_cache_ratio = cache_pct
                 pt = (result["usage"] or {}).get("prompt_tokens", 0)
                 ct = (result["usage"] or {}).get("completion_tokens", 0)
                 cached = (result["usage"] or {}).get("prompt_tokens_details", {}).get("cached_tokens", 0)
                 self.totals["prompt_tokens"] += pt
                 self.totals["completion_tokens"] += ct
                 self.totals["cached_tokens"] += cached
-                # Finalize the record and move to done
-                rec.status = "done"
-                rec.completed_at = datetime.now(timezone.utc).isoformat()
-                rec.result = result
-                rec.duration_s = result["duration_s"]
-                rec.model = self.last_model
-                # Audit-log entry (also visible via list_tasks)
-                self._tasks.append({
-                    "idx": self.call_count, "ts": t0,
-                    "text_preview": rec.text_preview,
-                    "model": self.last_model, "duration_s": result["duration_s"],
-                    "prompt_tokens": pt, "completion_tokens": ct,
-                    "cached_tokens": cached, "cache_ratio": cache_pct,
-                    "stop_reason": result["stop_reason"],
-                })
-                # Move to done ring; clear inflight
-                self._tasks_done.append(rec)
-                self._inflight = None
+                # Finalize the record.
+                if was_cancelled:
+                    # Cancelled: persist result with cancelled status, do
+                    # NOT touch _inflight or _tasks_done. The user already
+                    # accepted that this call is being thrown away.
+                    rec.status = "cancelled"
+                    rec.completed_at = datetime.now(timezone.utc).isoformat()
+                    rec.result = result
+                    rec.duration_s = result["duration_s"]
+                    rec.model = used or rec.model
+                else:
+                    rec.status = "done"
+                    rec.completed_at = datetime.now(timezone.utc).isoformat()
+                    rec.result = result
+                    rec.duration_s = result["duration_s"]
+                    rec.model = self.last_model
+                    # Audit-log entry (also visible via list_tasks)
+                    self._tasks.append({
+                        "idx": self.call_count, "ts": t0,
+                        "text_preview": rec.text_preview,
+                        "model": self.last_model, "duration_s": result["duration_s"],
+                        "prompt_tokens": pt, "completion_tokens": ct,
+                        "cached_tokens": cached, "cache_ratio": cache_pct,
+                        "stop_reason": result["stop_reason"],
+                    })
+                    # Move to done ring; clear inflight
+                    self._tasks_done.append(rec)
+                    self._inflight = None
             # Persist + log + wake AFTER releasing the lock (don't hold
             # _task_lock across IO or event set).
             _save_task(rec)
-            _log_line("prompt", task_id=task_id, call_id=self.call_count,
-                      model=self.last_model, dur_s=result["duration_s"],
-                      pt=pt, ct=ct, cached=cached, cache_pct=cache_pct,
-                      stop=result["stop_reason"])
+            if was_cancelled:
+                _log_line("prompt_cancelled", task_id=task_id, dur_s=round(duration, 2),
+                          model=used)
+            else:
+                _log_line("prompt", task_id=task_id, call_id=self.call_count,
+                          model=self.last_model, dur_s=result["duration_s"],
+                          pt=pt, ct=ct, cached=cached, cache_pct=cache_pct,
+                          stop=result["stop_reason"])
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
             with self._task_lock:
-                rec.status = "error"
+                was_cancelled = (self._inflight is not rec)
+                rec.status = "cancelled" if was_cancelled else "error"
                 rec.error = err
                 rec.completed_at = datetime.now(timezone.utc).isoformat()
                 rec.duration_s = round(time.time() - t0, 2)
-                self._tasks_done.append(rec)
-                self._inflight = None
+                if not was_cancelled:
+                    self._tasks_done.append(rec)
+                    self._inflight = None
             _save_task(rec)
-            _log_line("prompt_error", task_id=task_id, err=err)
+            _log_line("prompt_error" if not was_cancelled else "prompt_cancelled",
+                      task_id=task_id, err=err)
         finally:
             # Wake any get_result waiter. The event is sticky (set until
             # cleared on next submit) so callers that re-check after the
             # first set see "done" rather than blocking forever.
             self._task_event.set()
 
-    def get_result(self, task_id: str, wait_timeout_s: int = 3600,
-                   mode: str = "blocking") -> dict:
-        """Fetch the result of a previously submitted task.
+    def cancel_task(self, task_id: str) -> dict:
+        """Cancel an in-flight or recent task. Frees the wrapper to accept
+        a new submit. The actual codebuddy subprocess call (if in-flight)
+        continues running but its result is discarded when the daemon
+        thread finishes — it gets persisted with status='cancelled' and
+        does not enter _tasks_done. This avoids the race where a freshly-
+        spawned in-flight task gets overwritten by a late result from the
+        cancelled one.
 
-        mode="blocking" (default): wait up to wait_timeout_s for the task
-        to complete, then return its current state. If the task is
-        already done, return immediately. wait_timeout_s <= 0 = no wait,
-        return current state.
-        mode="poll": always return current state immediately, no wait.
-
-        Single in-flight: when a task is in flight, you can wait on it.
-        When it's not in flight, we look in the in-memory done ring first,
-        then fall back to the on-disk task file (for tasks completed by
-        previous wrapper processes).
+        Idempotent: cancelling an already-cancelled/done task is a no-op
+        (returns the existing record).
         """
+        was_inflight = False
+        with self._task_lock:
+            # Check in-memory first
+            inflight = self._inflight
+            if inflight is not None and inflight.task_id == task_id:
+                # Currently in-flight. Mark cancelled, clear _inflight.
+                inflight.status = "cancelled"
+                inflight.completed_at = datetime.now(timezone.utc).isoformat()
+                inflight.error = "cancelled by user"
+                cancelled = inflight
+                was_inflight = True
+                self._inflight = None
+            else:
+                # Maybe in _tasks_done (recent)
+                cancelled = None
+                for d in self._tasks_done:
+                    if d.task_id == task_id:
+                        d.status = "cancelled"
+                        d.completed_at = datetime.now(timezone.utc).isoformat()
+                        d.error = "cancelled by user"
+                        cancelled = d
+                        break
+        if cancelled is None:
+            # Check disk (wrapper restart case or never-seen task_id)
+            disk = _load_task(task_id)
+            if disk is None:
+                return {"task_id": task_id, "status": "unknown",
+                        "error": "no such task_id"}
+            disk.status = "cancelled"
+            disk.completed_at = datetime.now(timezone.utc).isoformat()
+            disk.error = "cancelled by user"
+            _save_task(disk)
+            _log_line("task_cancelled", task_id=task_id, was_inflight=False)
+            return {"task_id": task_id, "status": "cancelled",
+                    "completed_at": disk.completed_at}
+        # Persist + log
+        _save_task(cancelled)
+        _log_line("task_cancelled", task_id=task_id, was_inflight=was_inflight)
+        # Wake any get_result pollster
+        self._task_event.set()
+        return {"task_id": task_id, "status": "cancelled",
+                "completed_at": cancelled.completed_at}
+
+    def get_result(self, task_id: str, wait_timeout_s: int = 0,
+                   mode: str = "poll") -> dict:
+        """Fetch the result of a previously submitted task. ALWAYS POLL:
+        returns the current state immediately, never blocks the MCP
+        request. Caller should poll repeatedly (every few seconds) until
+        the status is 'done' / 'error' / 'cancelled' / 'stale' / 'unknown'.
+
+        Why no blocking mode: mcode's MCP client enforces a per-request
+        timeout on every MCP call. A blocking get_result would hold the
+        MCP request for the codebuddy call duration and be killed by the
+        client timeout — same failure mode as the legacy sync `prompt`
+        tool. The `run` tool handles the wait+retrieve case via an
+        internal short-poll loop bounded to ~30s; for longer calls, poll
+        get_result separately from the caller.
+
+        `wait_timeout_s` and `mode` are accepted for API compatibility
+        but ignored; passing 'blocking' raises ValueError so callers that
+        relied on the old behavior fail loudly.
+        """
+        if mode not in ("poll", "blocking"):
+            raise ValueError(f"get_result: invalid mode {mode!r}; only 'poll' is supported")
+        if mode == "blocking":
+            raise ValueError(
+                "get_result blocking mode was removed in 0.4.1 — it held the MCP "
+                "request and hit the client's per-request timeout, the same failure "
+                "mode as the legacy sync `prompt` tool. Use mode='poll' and call "
+                "get_result repeatedly, or use the `run` tool which does an internal "
+                "short-poll loop bounded to ~30s. The `run` tool's MCP request lifetime "
+                "is bounded so it survives the client's per-request timeout."
+            )
         # 1. Look in done ring (in-memory)
         with self._task_lock:
             for d in reversed(self._tasks_done):
                 if d.task_id == task_id:
-                    if d.status == "done":
-                        return {"task_id": task_id, "status": "done",
-                                "result": d.result}
                     return {"task_id": task_id, "status": d.status,
-                            "error": d.error}
+                            "result": d.result, "error": d.error,
+                            "completed_at": d.completed_at}
             # 2. Look at in-flight
             inflight = self._inflight
         if inflight is not None and inflight.task_id == task_id:
-            if mode == "blocking" and wait_timeout_s > 0:
-                # The event stays set after the task finishes (sticky
-                # until the next submit clears it). So we use a flag
-                # derived from a poll loop, not a single .wait() call —
-                # otherwise a caller calling get_result on a task that
-                # finished during a previous get_result call would block
-                # forever.
-                end = time.time() + wait_timeout_s
-                while time.time() < end:
-                    if self._task_event.wait(timeout=1.0):
-                        # Re-check done ring
-                        with self._task_lock:
-                            for d in reversed(self._tasks_done):
-                                if d.task_id == task_id:
-                                    if d.status == "done":
-                                        return {"task_id": task_id, "status": "done",
-                                                "result": d.result}
-                                    return {"task_id": task_id, "status": d.status,
-                                            "error": d.error}
-                        # Event set but our task isn't in done ring —
-                        # it must be a different task. Keep waiting until
-                        # either the deadline or our task appears.
-                    # While waiting, also check disk: a wrapper restart
-                    # would have made us forget the task. The poll
-                    # interval is 1s; in practice the disk check is rare.
-                    disk = _load_task(task_id)
-                    if disk and disk.status in ("done", "error", "stale"):
-                        return {"task_id": task_id, "status": disk.status,
-                                "result": disk.result,
-                                "error": disk.error}
-                return {"task_id": task_id, "status": "running",
-                        "elapsed_s": _safe_elapsed(inflight.submitted_at)}
-            # poll mode OR wait_timeout_s=0: just return running state
-            return {"task_id": task_id, "status": "running"}
+            return {"task_id": task_id, "status": "running",
+                    "submitted_at": inflight.submitted_at,
+                    "model": inflight.model,
+                    "elapsed_s": _safe_elapsed(inflight.submitted_at)}
         # 3. Not in-memory: try disk (covers wrapper-restart recovery)
         disk = _load_task(task_id)
         if disk is not None:
-            if disk.status == "done":
-                return {"task_id": task_id, "status": "done", "result": disk.result}
-            if disk.status in ("error", "stale"):
-                return {"task_id": task_id, "status": disk.status,
-                        "error": disk.error,
-                        "result": disk.result}
+            return {"task_id": task_id, "status": disk.status,
+                    "result": disk.result, "error": disk.error,
+                    "completed_at": disk.completed_at}
         return {"task_id": task_id, "status": "unknown",
                 "error": "no such task_id (may have been GC'd or never existed)"}
 
@@ -794,19 +854,27 @@ class ACPSession:
 
     def status(self) -> dict:
         alive = self.proc.poll() is None
+        with self._task_lock:
+            inflight = self._inflight
+        # Gap 4 (0.4.1): when no completed call has populated last_model
+        # yet but an in-flight task is running, expose the in-flight
+        # task's model as a fallback. The wrapper's "primary" model
+        # surface is now: last completed model, else in-flight model,
+        # else None.
+        effective_model = self.last_model or (inflight.model if inflight else None)
         out = {
             "alive": alive, "codebuddy_pid": self.pid if alive else None,
-            "acp_session_id": self.session_id, "model": self.last_model,
+            "acp_session_id": self.session_id, "model": effective_model,
             "started_at": self.started_at, "uptime_s": round(time.time() - self.started_at, 1),
             "call_count": self.call_count, "last_call_at": self.last_call_at,
             "last_cache_ratio": self.last_cache_ratio, "totals": dict(self.totals),
         }
         # 0.4.0 in-flight surface: the async API uses these for polling.
-        with self._task_lock:
-            if self._inflight is not None:
-                out["inflight_task_id"] = self._inflight.task_id
-                out["inflight_submitted_at"] = self._inflight.submitted_at
-                out["inflight_elapsed_s"] = _safe_elapsed(self._inflight.submitted_at)
+        if inflight is not None:
+            out["inflight_task_id"] = inflight.task_id
+            out["inflight_submitted_at"] = inflight.submitted_at
+            out["inflight_model"] = inflight.model
+            out["inflight_elapsed_s"] = _safe_elapsed(inflight.submitted_at)
         return out
 
     def list_tasks(self, limit: int = 10) -> list[dict]:
@@ -886,7 +954,7 @@ def _health_check_codebuddy(cb_bin: str) -> None:
 
 
 def get_session() -> ACPSession:
-    global _session
+    global _session, _models_cache
     with _session_lock:
         if _session is None or _session.proc.poll() is not None:
             cwd = os.environ.get("CODEBUDDY_MCP_CWD") or os.getcwd()
@@ -896,6 +964,12 @@ def get_session() -> ACPSession:
             # subprocess. This is the only time we pay the 0.5-1s cost.
             _health_check_codebuddy(cb_bin)
             _session = ACPSession(codebuddy_bin=cb_bin, cwd=cwd, mcode_base_prompt_file=base)
+            # Gap 3 (0.4.1): a fresh session may have a richer
+            # `models.availableModels` catalog than the cached
+            # `codebuddy --help` parse. Invalidate so the next list_models
+            # call picks up the live session data.
+            with _models_cache_lock:
+                _models_cache = None
         return _session
 
 
@@ -1029,22 +1103,22 @@ TOOL_SUBMIT_CONTINUE = Tool(
 )
 TOOL_GET_RESULT = Tool(
     name="get_result",
-    description=("Fetch the result of a previously submitted task by task_id. mode='blocking' (default) waits up to wait_timeout_s for completion; mode='poll' returns the current state immediately. default wait_timeout_s=3600 (1h). Returns `{task_id, status: 'running'|'done'|'error'|'stale'|'unknown', result?, error?}`."),
+    description=("Fetch the result of a previously submitted task by task_id. Always returns immediately (millisecond-scale MCP request). Caller should poll repeatedly (every 2-3s) until the returned status is 'done' / 'error' / 'cancelled' / 'stale' / 'unknown'. The `mode` parameter is accepted for API compatibility but only 'poll' is supported — passing 'blocking' raises an error. For a single-call submit+wait flow that respects the MCP client's per-request timeout, use the `run` tool which does an internal short-poll loop (≤30s) instead."),
     inputSchema={
         "type": "object",
         "properties": {
             "task_id": {"type": "string", "description": "The task_id returned by submit_prompt or submit_continue."},
-            "wait_timeout_s": {"type": "integer", "default": 3600,
-                               "description": "For mode='blocking': seconds to wait for the task to complete before returning 'running' state. 0 = no wait. default 3600 (1h)."},
-            "mode": {"type": "string", "default": "blocking", "enum": ["blocking", "poll"],
-                     "description": "'blocking' waits up to wait_timeout_s; 'poll' returns current state immediately."},
+            "wait_timeout_s": {"type": "integer", "default": 0,
+                               "description": "DEPRECATED: ignored. get_result is now always poll-mode (instant return)."},
+            "mode": {"type": "string", "default": "poll", "enum": ["poll"],
+                     "description": "Only 'poll' is supported. Passing 'blocking' raises an error."},
         },
         "required": ["task_id"],
     },
 )
 TOOL_RUN = Tool(
     name="run",
-    description=("Convenience tool: submit a codebuddy call and block until the result is ready (internally does submit + blocking get_result). Use this for the common case where the caller is OK holding an MCP request for the duration of the codebuddy call. default wait_timeout_s=3600 (1h). The MCP request itself only holds the wait_timeout_s window — NOT the codebuddy call's own runtime, which is bounded by `ACPSession.timeout` (1h). For truly long calls (>1h), use submit_prompt + get_result separately so a brief MCP request can poll for the result."),
+    description=("Convenience tool: submit a codebuddy call and wait up to 30 seconds (or wait_timeout_s, whichever is smaller) for it to finish, polling every 2s. If the call finishes within the window, returns the formatted result. If still running, returns {status: 'running', task_id, submitted_at, model, elapsed_s} — the caller should then call get_result(task_id) to keep polling. Use this from a worker. The MCP request lifetime is bounded to 30s (or wait_timeout_s), so it survives the client's per-request timeout. For calls expected to take >30s, use submit_prompt + repeated get_result calls instead."),
     inputSchema={
         "type": "object",
         "properties": {
@@ -1053,7 +1127,7 @@ TOOL_RUN = Tool(
                 # submit-only fields (no `timeout` on submit; get_result owns waiting)
             },
             "wait_timeout_s": {"type": "integer", "default": 3600,
-                               "description": "Max seconds to block waiting for the result. default 3600 (1h). The MCP request only holds this window, not the codebuddy call's own runtime."},
+                               "description": "Upper bound on how long the internal poll loop will wait. The actual MCP request lifetime is min(wait_timeout_s, 30). default 3600 (1h) — the wrapper is consistent with the 1h-default plugin convention, but the run tool itself only blocks the MCP request for ≤30s."},
         },
         "required": ["text"],
     },
@@ -1073,9 +1147,20 @@ TOOL_LIST_MODELS = Tool(
     description=("List codebuddy's supported model IDs. Reads from the live ACP session's `models.availableModels` (rich: per-model credits / maxInputTokens / supportsReasoning); falls back to parsing `codebuddy --help` only if no session is live yet. Use this before passing a `model=` argument to verify the model id is valid (e.g. `deepseek-v4-flash`, `hy3`). Returns `{ok, models: [id, ...], count, source}` plus a `rich` array with per-model metadata on success; `{ok: false, error, ...}` on failure. Cached per process."),
     inputSchema={"type": "object", "properties": {}, "additionalProperties": False},
 )
+TOOL_CANCEL_TASK = Tool(
+    name="cancel_task",
+    description=("Cancel an in-flight or recent task. Use this when a codebuddy call is hung (model API issue, codebuddy CLI bug, network) and the wrapper is stuck on a single in-flight task. Marks the task as cancelled and frees the wrapper to accept a new submit. The actual codebuddy subprocess call continues running but its result is discarded when the daemon thread finishes — it gets persisted with status='cancelled' and does not enter list_tasks / get_result's in-memory results. Idempotent: cancelling an already-cancelled/done task returns the existing record."),
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": "The task_id returned by submit_prompt / submit_continue, or observed in status / list_tasks as the in-flight task."},
+        },
+        "required": ["task_id"],
+    },
+)
 
 ALL_TOOLS = [TOOL_SUBMIT_PROMPT, TOOL_SUBMIT_CONTINUE, TOOL_GET_RESULT, TOOL_RUN,
-             TOOL_STATUS, TOOL_LIST_TASKS, TOOL_LIST_MODELS]
+             TOOL_CANCEL_TASK, TOOL_STATUS, TOOL_LIST_TASKS, TOOL_LIST_MODELS]
 
 
 async def _list_tools(ctx, params):
@@ -1152,15 +1237,35 @@ async def _call_tool(ctx, params):
         if sub.get("status") == "busy":
             return CallToolResult(content=[TextContent(type="text",
                 text=json.dumps(sub, ensure_ascii=False))])
+        task_id = sub["task_id"]
+        # Gap 1 (0.4.1): run does submit + internal short-poll loop. The
+        # MCP request lifetime is bounded to RUN_POLL_BUDGET_S so the
+        # MCP client's per-request timeout doesn't kill us mid-call. Each
+        # iteration does one millisecond-scale get_result (poll mode).
+        # If the codebuddy call finishes within the budget, we return
+        # the result; otherwise we return the current "running" state and
+        # the caller can continue polling with get_result separately.
+        RUN_POLL_BUDGET_S = 30
         wait = int(arguments.get("wait_timeout_s", 3600))
-        result = sess.get_result(sub["task_id"], wait_timeout_s=wait, mode="blocking")
-        if result.get("status") == "done":
-            # Format like the old sync result so callers can pipe the
-            # output directly into their next step.
+        budget = min(wait, RUN_POLL_BUDGET_S)
+        deadline = time.monotonic() + budget
+        result = None
+        while True:
+            result = sess.get_result(task_id)
+            if result.get("status") != "running":
+                break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(2.0)
+        # Final result: either done/error/cancelled/stale/unknown (the
+        # loop exited because the call completed) or running (budget
+        # exhausted). Format like the old sync result for done.
+        if result.get("status") == "done" and result.get("result"):
             return CallToolResult(content=[TextContent(type="text",
                 text=_format_result(result["result"]))])
-        # Error / stale / unknown: return the structured result so the
-        # caller sees what went wrong.
+        # Anything else: return the structured result so the caller sees
+        # what happened (or "running" with task_id so they can continue
+        # polling with get_result).
         return CallToolResult(content=[TextContent(type="text",
             text=json.dumps(result, ensure_ascii=False))])
     if name == "status":
@@ -1174,6 +1279,14 @@ async def _call_tool(ctx, params):
     if name == "list_models":
         result = list_codebuddy_models()
         return CallToolResult(content=[TextContent(type="text", text="[codebuddy list_models]\n" + json.dumps(result, ensure_ascii=False, indent=2))])
+    if name == "cancel_task":
+        task_id = arguments.get("task_id")
+        if not task_id:
+            raise ValueError("cancel_task: missing required arg: task_id")
+        sess = get_session()
+        result = sess.cancel_task(task_id)
+        return CallToolResult(content=[TextContent(type="text",
+            text=json.dumps(result, ensure_ascii=False))])
     raise ValueError(f"unknown tool: {name}")
 
 

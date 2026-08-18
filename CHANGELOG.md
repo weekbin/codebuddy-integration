@@ -4,6 +4,78 @@ All notable changes to this plugin are documented in this file. The format is ba
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-08-18
+
+### Fixed
+- **`MCP error -32001` on `get_result` blocking** (the second 2026-08-18 incident
+  found via real `mcode` + `deepseek-v4-flash` test). Root cause: 0.4.0 assumed the
+  MCP client's per-request timeout was per-tool-call. It is actually per-MCP-request.
+  So `get_result(wait_timeout_s=120, mode="blocking")` held the MCP request for
+  the codebuddy call duration and was killed by the same client timeout as the
+  legacy sync `prompt` tool. Fix:
+  - `get_result` is now **poll-only** (millisecond-scale MCP request). `mode="blocking"`
+    is removed; passing it raises `ValueError` with a clear migration message.
+  - The `run` tool does `submit + short-poll loop (≤30s)` internally, so the MCP
+    request lifetime is bounded. If the codebuddy call finishes within the window,
+    the result is returned. If not, `run` returns `{status: "running", task_id, ...}`
+    and the caller should use `get_result` to keep polling.
+- **No recovery path for hung in-flight tasks** (Gap 2). When a codebuddy call
+  hung (verified: 9+ min for a 1-sentence deepseek-v4-flash prompt, codebuddy
+  subprocess at 1.2% CPU in `ep_poll`), the wrapper was wedged — `submit_prompt`
+  returned `{"status": "busy"}` and there was no way to clear the in-flight. Fix:
+  added `cancel_task(task_id)` tool. Marks the task as `cancelled` on disk; the
+  actual codebuddy daemon thread continues running but its result is discarded
+  (persisted with status="cancelled", does NOT enter _tasks_done). The wrapper
+  is freed to accept a new submit immediately. The daemon thread's
+  `_run_prompt_in_thread` checks `self._inflight is rec` at finalization time
+  to detect this case and write the cancelled-record path instead of the normal
+  done path — a race-free implementation.
+
+### Changed
+- **`get_result` API surface**: `wait_timeout_s` parameter is now a no-op
+  (default 0). `mode` parameter is accepted but only `"poll"` is valid.
+  Both are kept in the signature for API compatibility with old callers.
+- **`status.model` now falls back to in-flight model** (Gap 4). When no
+  completed call has populated `last_model` yet but an in-flight task is
+  running, the in-flight task's model is exposed via `status.model` and
+  `status.inflight_model`. Previously, `status.model` was `null` until the
+  first call completed.
+- **`list_models` cache invalidation** (Gap 3). When a fresh `ACPSession`
+  is created in `get_session()`, the `_models_cache` is reset to `None`
+  so the next `list_models` call picks up the live session's
+  `models.availableModels` (rich metadata) instead of returning the stale
+  `codebuddy --help` parse.
+- **`run` MCP request lifetime is bounded to 30s** (or `wait_timeout_s`,
+  whichever is smaller). Each internal `get_result` poll is 2s apart. This
+  survives the MCP client's per-request timeout and still returns the
+  result for the common short call case. The 1h `wait_timeout_s` default
+  remains the upper bound for the call's logical wait, but the MCP request
+  itself never holds for more than 30s.
+
+### Added
+- **8th tool: `cancel_task(task_id)`**. Use this when a codebuddy call is
+  hung and you need the wrapper back. Frees the wrapper immediately;
+  the in-flight call's actual codebuddy subprocess continues to run
+  (we can't kill it cleanly without losing the long-lived session) but
+  its result is discarded. Idempotent on already-cancelled/done tasks.
+- **9 new unit tests**: cancel_task (4 tests: in-flight, done, unknown,
+  from-disk), get_result poll-only (3 tests: blocking raises, unknown mode
+  raises, poll inflight), status model fallback (1 test). Total: 64 tests.
+
+### Removed
+- **`get_result` blocking mode**. The mode parameter is accepted but only
+  `"poll"` is valid; passing `"blocking"` raises ValueError. Use the `run`
+  tool for the "submit + bounded wait" flow, or call `get_result` repeatedly
+  in poll mode for calls expected to take >30s.
+
+### Kept
+- 5 MCP timeout env vars in `mcp.json` (all 1h).
+- Task persistence to `${PLUGIN_DATA}/tasks/<task_id>.json` with `TASK_LIFETIME_S=86400` (24h).
+- Worker restart GC marks in-flight tasks as `stale`.
+- Audit log format `mcp-YYYY-MM-DD.log` pipe-separated kv.
+
+
+
 ## [0.4.0] - 2026-08-18
 
 ### Added
