@@ -4,6 +4,14 @@ All notable changes to this plugin are documented in this file. The format is ba
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.8] - 2026-08-18
+
+### Changed
+- **Default invocation pattern is now `task(worker) → mcp__codebuddy__*` for every codebuddy call, not just long ones.** The old "Long task / >30s / 50k+ tokens / parallel work" rule was the only place mentioning the background-worker pattern, which under-stated its value. The pattern's payoff is decoupling the main agent from codebuddy latency, not just the long-task case: a 2s codebuddy call inside a sync `mcp__codebuddy__prompt(...)` blocks the main agent for 2s; the same call inside a `task(run_in_background=true, agent_name="worker", ...)` returns immediately and the parent does independent work in parallel. Replaced the old rule 3 with a "Default pattern — worker → mcp" rule that says this explicitly, names sync as the deliberate fallback, and cites the 2026-08-18 verification (three `deepseek-v4-flash` calls in one session, all hitting the same long-lived `codebuddy --acp` subprocess, prefix cache monotonic 2.2% → 52.8% → 99.6%).
+
+### Added
+- **Worker prompt template** as a worked example at the end of SKILL.md. Pinpoints the right child-agent briefing shape: short, single-purpose, "do exactly this and return the tool result verbatim" — no preamble, no analysis, no other tool calls. The child is context-free on purpose; codebuddy's full turn history stays in the wrapper's acp session, not in the worker's context window, and the main agent's context isn't polluted either.
+
 ## [0.3.7] - 2026-08-18
 
 ### Fixed
