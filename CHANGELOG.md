@@ -4,6 +4,78 @@ All notable changes to this plugin are documented in this file. The format is ba
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-08-18
+
+### Added
+- **Async submit/poll MCP API**: 4 new tools — `submit_prompt`, `submit_continue`,
+  `get_result`, `run` — alongside the existing `status` / `list_tasks` / `list_models`.
+  `run` is a convenience wrapper that does `submit_prompt` + blocking `get_result`
+  in one call. 7 tools total.
+- **Task persistence to `${PLUGIN_DATA}/tasks/<task_id>.json`**: each in-flight or
+  completed codebuddy call is recorded to disk. Wrapper restart recovery marks
+  in-flight tasks as `stale` (callable via `get_result(task_id)`). Task lifetime
+  bounded by `TASK_LIFETIME_S=86400` (24h); older completed records are GC'd.
+- **5 MCP timeout env vars in `mcp.json`**: `MCP_SERVER_REQUEST_TIMEOUT=3600000` /
+  `MCP_REQUEST_TIMEOUT=3600` / `MCP_CONNECTION_TIMEOUT=3600` / `MCP_TIMEOUT=3600` /
+  `MCP_MAX_REQUEST_TIMEOUT=3600000` — all 1h, covering every common SDK env-var
+  name so any MCP client (current or future) sees the same 1h ceiling.
+- **Global 1h timeout default**: every timeout in the plugin — `ACPSession.timeout`
+  (codebuddy subprocess wait), `get_result` / `run` `wait_timeout_s`, the 5
+  MCP env vars — defaults to 3600s. Single source of truth: "if you don't pass
+  a timeout, the wrapper assumes 1h".
+
+### Changed
+- **MCP request lifetime is now millisecond-scale**: `submit_prompt` returns in
+  <50ms even for hour-long codebuddy calls. The actual codebuddy call runs in
+  a daemon thread on the wrapper. The MCP client's per-request timeout
+  (≤ 60s observed on mcode) can no longer drop long-call responses.
+- **Plugin docs rewritten to current state, zero history**: `SKILL.md` is a
+  minimal MVP (< 80 lines, no version pins, no "previously was X" notes);
+  `README.md` and `AGENTS.md` rewritten; grep guard enforces no historical
+  references in any forward-facing doc.
+- **`status()` now exposes in-flight state**: `inflight_task_id`,
+  `inflight_submitted_at`, `inflight_elapsed_s` when a codebuddy call is
+  running.
+- **`list_tasks()` now includes the in-flight task** as the first entry
+  (status=running) when one is present.
+- **`mcp-features-test.py` rewritten to use the 7 tools**: covers `run`,
+  `submit_prompt` + `get_result` round-trip, unknown task_id, and all the
+  0.3.x behaviors (cache reuse, dynamic model switch, append respawn,
+  thinking trace) translated to the new API.
+
+### Removed
+- **⚠️ BREAKING**: `prompt` and `continue` sync tools are gone. They are
+  replaced by `run` (convenience) or `submit_prompt` + `get_result`
+  (advanced). Old worker templates that call `mcp__codebuddy__prompt` will
+  now fail with `unknown tool: prompt` — migrate to `mcp__codebuddy__run`
+  (or to `submit_prompt` + `get_result` for the alternative pattern).
+- **`ACPSession.prompt` sync method deleted**; logic is now in
+  `_run_prompt_in_thread` only. Internal helper `_collect_response_artifacts`
+  is the pure function used by both the thread and the unit tests.
+- **`mcp-async-api-test.py` removed**: redundant with `mcp-features-test.py`
+  and lacking discriminating power over the new async semantics.
+
+### Fixed
+- **`MCP error -32001: Request timed out` on long codebuddy calls** (the
+  original 2026-08-18 incident). Root cause: mcode's MCP client has a
+  ≤ 60s per-request timeout that the `timeout=` parameter does NOT
+  override. The new async API sidesteps the issue entirely: every MCP
+  request is millisecond-scale, so the client timeout becomes irrelevant.
+- **`assets/mcode-base-system-prompt.md:3, :207` doc drift**: `--append-system-prompt-file`
+  → `--append-system-prompt` (matches the actual `wrapper.py:160` flag).
+  Was a 0.3.13-introduced drift; now fixed.
+
+### Kept
+- 4 test suite framework (`test_mcp_wrapper_unit` / `mcp-poc-test` /
+  `mcp-features-test` / `mcp-long-prompt-test`); 55 unit tests + 3 e2e tests.
+- Existing audit log format (`mcp-YYYY-MM-DD.log` pipe-separated kv).
+- `mcp.json` closed schema and Agent Plugins 1.0.0 spec compliance.
+- Existing `state/` write path (`${PLUGIN_DATA}/state` with `${PLUGIN_ROOT}/state`
+  fallback), lazy `mkdir`, and read-only-tolerant log drop.
+- `CODEBUDDY_MCP_DEBUG_LOG` debug env for raw ACP frame dump.
+
+
+
 ## [0.3.13] - 2026-08-18
 
 ### Fixed

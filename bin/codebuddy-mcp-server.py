@@ -15,6 +15,7 @@ Path(__file__).resolve().parent.parent to find its own plugin root,
 so it works regardless of where the plugin lives on disk.
 """
 import asyncio
+import dataclasses
 import json
 import os
 import re
@@ -51,6 +52,225 @@ else:
 # rule 5. The mkdir happens lazily on the first log write (see _log_line) inside
 # a try/except, so a read-only install silently drops log writes instead of
 # refusing to start.
+
+# ── Task persistence (Agent Plugins 1.0.0 async submit/poll model) ──
+# Each in-flight or completed codebuddy call is a TaskRecord persisted to
+# ${PLUGIN_DATA}/tasks/<task_id>.json. Wrapper restart GC marks any task still
+# in "running" state as "stale" so get_result returns a deterministic error
+# instead of pretending the call will complete. With the 0.4.0 async API,
+# the MCP request lifetime is millisecond-scale; the task lifetime is the
+# codebuddy call lifetime (potentially hours).
+
+TASKS_DIR = STATE_DIR / "tasks"
+# TASK_LIFETIME_S: how long completed task records stay on disk before they
+# are eligible for GC. Long enough that get_result after a wrapper restart
+# can still answer, short enough that the dir doesn't grow unbounded.
+TASK_LIFETIME_S = 86400  # 24h
+
+
+@dataclasses.dataclass
+class TaskRecord:
+    task_id: str
+    status: str  # "running" | "done" | "error" | "stale"
+    submitted_at: str
+    text_preview: str = ""
+    model: Optional[str] = None
+    completed_at: Optional[str] = None
+    result: Optional[dict] = None
+    error: Optional[str] = None
+    duration_s: Optional[float] = None
+
+
+def _task_to_dict(rec: TaskRecord) -> dict:
+    d = dataclasses.asdict(rec)
+    return d
+
+
+def _dict_to_task(d: dict) -> Optional[TaskRecord]:
+    try:
+        return TaskRecord(
+            task_id=d["task_id"],
+            status=d["status"],
+            submitted_at=d["submitted_at"],
+            text_preview=d.get("text_preview", ""),
+            model=d.get("model"),
+            completed_at=d.get("completed_at"),
+            result=d.get("result"),
+            error=d.get("error"),
+            duration_s=d.get("duration_s"),
+        )
+    except (KeyError, TypeError):
+        return None
+
+
+def _save_task(rec: TaskRecord) -> bool:
+    """Atomic write: tmp + rename. Returns True on success.
+
+    mkdir is best-effort; a read-only install silently drops the record.
+    Caller treats False as "task is in-memory only, will be lost on restart".
+    """
+    try:
+        TASKS_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return False
+    path = TASKS_DIR / f"{rec.task_id}.json"
+    tmp = path.with_suffix(".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_task_to_dict(rec), f, ensure_ascii=False)
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        try:
+            tmp.unlink()
+        except Exception:
+            pass
+        return False
+
+
+def _load_task(task_id: str) -> Optional[TaskRecord]:
+    """Load task from disk. Returns None if file missing, malformed, or
+    task_id contains anything outside [A-Za-z0-9_-] (defense against path
+    traversal via crafted task_id from a malicious caller).
+    """
+    if not task_id or not all(c.isalnum() or c in "-_." for c in task_id):
+        return None
+    if len(task_id) > 64:
+        return None
+    path = TASKS_DIR / f"{task_id}.json"
+    if not path.exists():
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return _dict_to_task(d)
+
+
+def _gc_orphan_tasks() -> int:
+    """Mark any status='running' task as 'stale' (wrapper-restart recovery).
+    Also drop completed task files older than TASK_LIFETIME_S to keep the
+    dir bounded. Returns the number of tasks touched.
+    """
+    if not TASKS_DIR.exists():
+        return 0
+    touched = 0
+    now = time.time()
+    cutoff = now - TASK_LIFETIME_S
+    for path in list(TASKS_DIR.glob("*.json")):
+        try:
+            with open(path, encoding="utf-8") as f:
+                d = json.load(f)
+            rec = _dict_to_task(d)
+            if rec is None:
+                continue
+            changed = False
+            if rec.status == "running":
+                rec.status = "stale"
+                rec.error = "wrapper restarted while this task was in-flight"
+                rec.completed_at = datetime.now(timezone.utc).isoformat()
+                changed = True
+                touched += 1
+            elif rec.status in ("done", "error", "stale") and rec.completed_at:
+                try:
+                    completed_ts = datetime.fromisoformat(rec.completed_at).timestamp()
+                    if completed_ts < cutoff:
+                        path.unlink()
+                        touched += 1
+                        continue
+                except ValueError:
+                    pass
+            if changed:
+                _save_task(rec)
+        except (OSError, json.JSONDecodeError):
+            continue
+    return touched
+
+
+def _safe_elapsed(submitted_at: str) -> Optional[float]:
+    """Compute elapsed seconds since an ISO-8601 timestamp; return None
+    if the timestamp can't be parsed (defensive — bad data on disk should
+    not crash get_result)."""
+    try:
+        ts = datetime.fromisoformat(submitted_at).timestamp()
+        return round(time.time() - ts, 2)
+    except (ValueError, TypeError):
+        return None
+
+
+def _collect_response_artifacts(r: dict, notifications: list,
+                                include_thinking: bool,
+                                fallback_model: Optional[str]) -> dict:
+    """Pure function: turn (immediate response + drained notifications) into
+    the final result dict. Extracted from the old sync `prompt()` so the
+    background thread and the unit tests can both use it without going
+    through the whole codebuddy subprocess.
+
+    `duration_s` and `cb_pid` are zero/Nones here; the caller fills them
+    in (the thread knows wall time and pid; tests know their fixtures).
+    """
+    message = r.get("text") or r.get("message") or "" if isinstance(r, dict) else ""
+    thinking = ""
+    tool_calls: list[dict] = []
+    usage = None
+    used_model: Optional[str] = None
+    for n in notifications:
+        upd = n.get("params", {}).get("update", {})
+        kind = upd.get("sessionUpdate")
+        # Concatenate every agent_message_chunk (the 0.3.1 truncation bug
+        # fix carried forward).
+        if kind == "agent_message_chunk":
+            message += upd.get("content", {}).get("text", "")
+        elif kind == "agent_thought_chunk":
+            thinking += upd.get("content", {}).get("text", "")
+        elif kind == "tool_call":
+            tool_calls.append({
+                "id": upd.get("toolCallId"),
+                "title": upd.get("title"),
+                "kind": upd.get("kind"),
+                "status": upd.get("status"),
+            })
+        elif kind == "tool_call_update":
+            tc_id = upd.get("toolCallId")
+            for tc in tool_calls:
+                if tc.get("id") == tc_id:
+                    new_status = upd.get("status")
+                    if new_status: tc["status"] = new_status
+                    break
+        elif kind == "usage_update":
+            u = upd.get("_meta", {}).get("usage")
+            if u: usage = u
+        elif kind == "session_info_update":
+            m = upd.get("_meta", {}).get("codebuddy.ai/requestModelId")
+            if m: used_model = m
+        elif kind in ("agent_thought_chunk", "agent_message_chunk"):
+            m = upd.get("_meta", {}).get("codebuddy.ai/responseModelId")
+            if m: used_model = m
+    if not usage and isinstance(r, dict):
+        meta = r.get("_meta", {})
+        usage = meta.get("usage") or meta.get("codebuddy.ai/usage") or r.get("usage") or {}
+    if used_model:
+        fallback_model = used_model
+    pt = (usage or {}).get("prompt_tokens", 0)
+    ct = (usage or {}).get("completion_tokens", 0)
+    cached = (usage or {}).get("prompt_tokens_details", {}).get("cached_tokens", 0)
+    cache_pct = round(100 * cached / pt, 1) if pt else 0.0
+    result = {
+        "text": message or "(no message received from codebuddy)",
+        "usage": usage or {},
+        "model": fallback_model,
+        "duration_s": 0.0,  # caller overrides
+        "stop_reason": r.get("stopReason") if isinstance(r, dict) else None,
+        "cb_pid": None,      # caller overrides
+        "cache_ratio": cache_pct,
+        "tool_calls": tool_calls,
+    }
+    if include_thinking and thinking:
+        result["thinking"] = thinking
+        result["thinking_chars"] = len(thinking)
+    return result
+
 
 # ── structured logger ─────────────────────
 _log_lock = threading.Lock()
@@ -131,6 +351,15 @@ class ACPSession:
         self.last_cache_ratio: Optional[float] = None
         self.totals = {"prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0}
         self._tasks: deque = deque(maxlen=50)
+        # 0.4.0 async submit/poll state: in-flight task + completed-task ring
+        # + wakeup event for blocking get_result. The single in-flight
+        # constraint (one codebuddy call at a time per session) is by design
+        # — codebuddy is a single subprocess with a single sessionId, so
+        # concurrent calls would serialize at the JSON-RPC layer anyway.
+        self._inflight: Optional[TaskRecord] = None
+        self._tasks_done: deque[TaskRecord] = deque(maxlen=50)
+        self._task_event: threading.Event = threading.Event()
+        self._task_lock: threading.Lock = threading.Lock()
         self._spawn(self._appended_text)
         self.pid = self.proc.pid
         self._reader = threading.Thread(target=self._read_loop, daemon=True, name="acp-reader")
@@ -340,140 +569,245 @@ class ACPSession:
             self._respawn(model=new_model)
         self.last_model = new_model
 
-    def prompt(self, text, model=None, append_system_prompt=None,
-               include_thinking=False, timeout=None) -> dict:
-        timeout = timeout or self.timeout
-        if append_system_prompt and append_system_prompt != self._appended_text:
-            self._respawn(append_text=append_system_prompt)
-            self._appended_text = append_system_prompt
-        if model and (not self.last_model or model != self.last_model):
-            # Model change: try the cheap ACP path first. If the server
-            # is on an old build that doesn't support set_config_option,
-            # _switch_model falls back to a subprocess respawn (the
-            # 0.3.2 path). Both paths preserve the caller's intent;
-            # neither needs the caller to know which happened.
-            self._switch_model(model)
+    # ── 0.4.0 async submit/poll API ───────────────────────────────────
+    def submit_prompt_async(self, text, model=None, append_system_prompt=None,
+                            include_thinking=False) -> dict:
+        """Submit a codebuddy call; return immediately with a task record.
+
+        The actual codebuddy subprocess work happens in a daemon thread.
+        Caller fetches the result later via get_result(task_id). This is
+        what makes every MCP request millisecond-scale: even a 30-minute
+        codebuddy call returns from submit_prompt_async in <50ms.
+
+        Single in-flight: if another task is already running on this
+        session, return a "busy" record (caller can wait for the in-flight
+        task via get_result on its own task_id, then submit again).
+        """
+        with self._task_lock:
+            if self._inflight is not None:
+                return {"status": "busy",
+                        "error": f"another task is in-flight ({self._inflight.task_id}); "
+                                 f"call get_result on it first"}
+            task_id = "tsk_" + uuid.uuid4().hex[:12]
+            now = datetime.now(timezone.utc).isoformat()
+            rec = TaskRecord(
+                task_id=task_id, status="running",
+                submitted_at=now,
+                text_preview=text[:80] + ("..." if len(text) > 80 else ""),
+                model=model or self.last_model,
+            )
+            self._inflight = rec
+        # Persist + spawn thread OUTSIDE the lock so _run_prompt_in_thread
+        # can re-acquire it without deadlocking on a slow codebuddy call.
+        _save_task(rec)
+        self._task_event.clear()
+        thread = threading.Thread(
+            target=self._run_prompt_in_thread,
+            args=(task_id, text, model, append_system_prompt, include_thinking),
+            daemon=True, name=f"cb-task-{task_id}",
+        )
+        thread.start()
+        return {"task_id": task_id, "status": "running",
+                "submitted_at": rec.submitted_at,
+                "model": rec.model}
+
+    def _run_prompt_in_thread(self, task_id, text, model, append_system_prompt,
+                              include_thinking) -> None:
+        """Background worker: runs the actual codebuddy session/prompt,
+        collects streaming chunks, persists the result. Mutates self state
+        under _task_lock and the codebuddy JSON-RPC state under _lock.
+        """
+        # We must hold a reference to the inflight record — re-fetch from
+        # _inflight is the cleanest way (it can't change because we
+        # rejected new submits while it's set).
+        with self._task_lock:
+            rec = self._inflight
+            if rec is None or rec.task_id != task_id:
+                # Should never happen: only this thread clears _inflight.
+                return
         t0 = time.time()
         try:
-            r = self.call("session/prompt", {
-                "sessionId": self.session_id,
-                "prompt": [{"type": "text", "text": text}],
-            }, timeout=timeout)
-        except Exception:
-            # Recovery path: the previous session/prompt call failed (e.g.
-            # the subprocess died mid-call). Spin up a fresh ACP session
-            # inside the same subprocess (model is set at spawn time, so no
-            # need to pass it here).
-            self._session_new()
-            r = self.call("session/prompt", {
-                "sessionId": self.session_id,
-                "prompt": [{"type": "text", "text": text}],
-            }, timeout=timeout)
-        duration = time.time() - t0
-        message = r.get("text") or r.get("message") or "" if isinstance(r, dict) else ""
-        thinking = ""
-        tool_calls: list[dict] = []  # internal tool execution (Write/Read/Bash/…)
-        usage = None
-        used_model = None
-        for n in self._drain_notifications():
-            upd = n.get("params", {}).get("update", {})
-            kind = upd.get("sessionUpdate")
-            # Concatenate every agent_message_chunk we see. The earlier
-            # `and not message` guard only collected the first chunk, which
-            # silently truncated any reply longer than a single streaming
-            # segment (verified 2026-08-18: a 2694-token reply came back as
-            # 3 chars). Keep the r.get("text") seed above so older server
-            # builds that put the full body in the immediate response still
-            # work — chunks then append, which is idempotent for the typical
-            # "all-in-first-chunk" case.
-            if kind == "agent_message_chunk":
-                message += upd.get("content", {}).get("text", "")
-            # Reasoning / "thinking" trace. Opt-in via include_thinking=True;
-            # default is off because this can be hundreds of chunks per call
-            # and bloats the response. We always capture to `thinking` (cheap,
-            # just a string concat) and only include it in the result when
-            # the caller asked.
-            elif kind == "agent_thought_chunk":
-                thinking += upd.get("content", {}).get("text", "")
-            # Tool execution: codebuddy is itself a coding agent — it can
-            # call Read/Write/Bash/etc. internally before answering. Capture
-            # the title + status of each so callers can show "I wrote X
-            # files" without seeing the raw I/O. Always included in result
-            # (small, structured, high-signal for "what did the agent do").
-            elif kind == "tool_call":
-                tool_calls.append({
-                    "id": upd.get("toolCallId"),
-                    "title": upd.get("title"),
-                    "kind": upd.get("kind"),
-                    "status": upd.get("status"),
+            # Serialize codebuddy I/O behind the existing _lock (the
+            # JSON-RPC socket and any model-switch subprocess work both
+            # need exclusive access).
+            with self._lock:
+                if append_system_prompt and append_system_prompt != self._appended_text:
+                    self._respawn(append_text=append_system_prompt)
+                    self._appended_text = append_system_prompt
+                if model and (not self.last_model or model != self.last_model):
+                    self._switch_model(model)
+                try:
+                    r = self.call("session/prompt", {
+                        "sessionId": self.session_id,
+                        "prompt": [{"type": "text", "text": text}],
+                    }, timeout=self.timeout)
+                except Exception:
+                    # Recovery: the subprocess died mid-call. Spin up a
+                    # fresh ACP session inside the same subprocess.
+                    self._session_new()
+                    r = self.call("session/prompt", {
+                        "sessionId": self.session_id,
+                        "prompt": [{"type": "text", "text": text}],
+                    }, timeout=self.timeout)
+            duration = time.time() - t0
+            notifications = self._drain_notifications()
+            result = _collect_response_artifacts(
+                r, notifications, include_thinking, self.last_model,
+            )
+            result["duration_s"] = round(duration, 2)
+            result["cb_pid"] = self.pid
+            # Update session-level stats under _task_lock so list_tasks
+            # and status see a consistent snapshot.
+            with self._task_lock:
+                used = result.get("model") or self.last_model
+                if used:
+                    self.last_model = used
+                self.call_count += 1
+                self.last_call_at = t0
+                cache_pct = result["cache_ratio"]
+                self.last_cache_ratio = cache_pct
+                pt = (result["usage"] or {}).get("prompt_tokens", 0)
+                ct = (result["usage"] or {}).get("completion_tokens", 0)
+                cached = (result["usage"] or {}).get("prompt_tokens_details", {}).get("cached_tokens", 0)
+                self.totals["prompt_tokens"] += pt
+                self.totals["completion_tokens"] += ct
+                self.totals["cached_tokens"] += cached
+                # Finalize the record and move to done
+                rec.status = "done"
+                rec.completed_at = datetime.now(timezone.utc).isoformat()
+                rec.result = result
+                rec.duration_s = result["duration_s"]
+                rec.model = self.last_model
+                # Audit-log entry (also visible via list_tasks)
+                self._tasks.append({
+                    "idx": self.call_count, "ts": t0,
+                    "text_preview": rec.text_preview,
+                    "model": self.last_model, "duration_s": result["duration_s"],
+                    "prompt_tokens": pt, "completion_tokens": ct,
+                    "cached_tokens": cached, "cache_ratio": cache_pct,
+                    "stop_reason": result["stop_reason"],
                 })
-            elif kind == "tool_call_update":
-                tc_id = upd.get("toolCallId")
-                for tc in tool_calls:
-                    if tc.get("id") == tc_id:
-                        new_status = upd.get("status")
-                        if new_status: tc["status"] = new_status
-                        break
-            elif kind == "usage_update":
-                u = upd.get("_meta", {}).get("usage")
-                if u: usage = u
-            elif kind == "session_info_update":
-                m = upd.get("_meta", {}).get("codebuddy.ai/requestModelId")
-                if m: used_model = m
-            elif kind in ("agent_thought_chunk", "agent_message_chunk"):
-                m = upd.get("_meta", {}).get("codebuddy.ai/responseModelId")
-                if m: used_model = m
-        if not usage and isinstance(r, dict):
-            meta = r.get("_meta", {})
-            usage = meta.get("usage") or meta.get("codebuddy.ai/usage") or r.get("usage") or {}
-        if used_model:
-            self.last_model = used_model
-        pt = (usage or {}).get("prompt_tokens", 0)
-        ct = (usage or {}).get("completion_tokens", 0)
-        cached = (usage or {}).get("prompt_tokens_details", {}).get("cached_tokens", 0)
-        cache_pct = round(100 * cached / pt, 1) if pt else 0.0
-        result = {
-            "text": message or "(no message received from codebuddy)",
-            "usage": usage or {},
-            "model": self.last_model,
-            "duration_s": round(duration, 2),
-            "stop_reason": r.get("stopReason") if isinstance(r, dict) else None,
-            "cb_pid": self.pid,
-            "cache_ratio": cache_pct,
-            "tool_calls": tool_calls,
-        }
-        # Thinking is opt-in: a 79s long task can produce 600+ thought
-        # chunks; always capturing (cheap) but only surfacing when asked.
-        if include_thinking and thinking:
-            result["thinking"] = thinking
-            result["thinking_chars"] = len(thinking)
-        self.call_count += 1
-        self.last_call_at = t0
-        self.last_cache_ratio = cache_pct
-        self.totals["prompt_tokens"] += pt
-        self.totals["completion_tokens"] += ct
-        self.totals["cached_tokens"] += cached
-        self._tasks.append({
-            "idx": self.call_count, "ts": t0,
-            "text_preview": text[:80] + ("..." if len(text) > 80 else ""),
-            "model": self.last_model, "duration_s": result["duration_s"],
-            "prompt_tokens": pt, "completion_tokens": ct, "cached_tokens": cached,
-            "cache_ratio": cache_pct, "stop_reason": result["stop_reason"],
-        })
-        _log_line("prompt", call_id=self.call_count, model=self.last_model,
-                  dur_s=result["duration_s"], pt=pt, ct=ct, cached=cached,
-                  cache_pct=cache_pct, stop=result["stop_reason"])
-        return result
+                # Move to done ring; clear inflight
+                self._tasks_done.append(rec)
+                self._inflight = None
+            # Persist + log + wake AFTER releasing the lock (don't hold
+            # _task_lock across IO or event set).
+            _save_task(rec)
+            _log_line("prompt", task_id=task_id, call_id=self.call_count,
+                      model=self.last_model, dur_s=result["duration_s"],
+                      pt=pt, ct=ct, cached=cached, cache_pct=cache_pct,
+                      stop=result["stop_reason"])
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            with self._task_lock:
+                rec.status = "error"
+                rec.error = err
+                rec.completed_at = datetime.now(timezone.utc).isoformat()
+                rec.duration_s = round(time.time() - t0, 2)
+                self._tasks_done.append(rec)
+                self._inflight = None
+            _save_task(rec)
+            _log_line("prompt_error", task_id=task_id, err=err)
+        finally:
+            # Wake any get_result waiter. The event is sticky (set until
+            # cleared on next submit) so callers that re-check after the
+            # first set see "done" rather than blocking forever.
+            self._task_event.set()
+
+    def get_result(self, task_id: str, wait_timeout_s: int = 3600,
+                   mode: str = "blocking") -> dict:
+        """Fetch the result of a previously submitted task.
+
+        mode="blocking" (default): wait up to wait_timeout_s for the task
+        to complete, then return its current state. If the task is
+        already done, return immediately. wait_timeout_s <= 0 = no wait,
+        return current state.
+        mode="poll": always return current state immediately, no wait.
+
+        Single in-flight: when a task is in flight, you can wait on it.
+        When it's not in flight, we look in the in-memory done ring first,
+        then fall back to the on-disk task file (for tasks completed by
+        previous wrapper processes).
+        """
+        # 1. Look in done ring (in-memory)
+        with self._task_lock:
+            for d in reversed(self._tasks_done):
+                if d.task_id == task_id:
+                    if d.status == "done":
+                        return {"task_id": task_id, "status": "done",
+                                "result": d.result}
+                    return {"task_id": task_id, "status": d.status,
+                            "error": d.error}
+            # 2. Look at in-flight
+            inflight = self._inflight
+        if inflight is not None and inflight.task_id == task_id:
+            if mode == "blocking" and wait_timeout_s > 0:
+                # The event stays set after the task finishes (sticky
+                # until the next submit clears it). So we use a flag
+                # derived from a poll loop, not a single .wait() call —
+                # otherwise a caller calling get_result on a task that
+                # finished during a previous get_result call would block
+                # forever.
+                end = time.time() + wait_timeout_s
+                while time.time() < end:
+                    if self._task_event.wait(timeout=1.0):
+                        # Re-check done ring
+                        with self._task_lock:
+                            for d in reversed(self._tasks_done):
+                                if d.task_id == task_id:
+                                    if d.status == "done":
+                                        return {"task_id": task_id, "status": "done",
+                                                "result": d.result}
+                                    return {"task_id": task_id, "status": d.status,
+                                            "error": d.error}
+                        # Event set but our task isn't in done ring —
+                        # it must be a different task. Keep waiting until
+                        # either the deadline or our task appears.
+                    # While waiting, also check disk: a wrapper restart
+                    # would have made us forget the task. The poll
+                    # interval is 1s; in practice the disk check is rare.
+                    disk = _load_task(task_id)
+                    if disk and disk.status in ("done", "error", "stale"):
+                        return {"task_id": task_id, "status": disk.status,
+                                "result": disk.result,
+                                "error": disk.error}
+                return {"task_id": task_id, "status": "running",
+                        "elapsed_s": _safe_elapsed(inflight.submitted_at)}
+            # poll mode OR wait_timeout_s=0: just return running state
+            return {"task_id": task_id, "status": "running"}
+        # 3. Not in-memory: try disk (covers wrapper-restart recovery)
+        disk = _load_task(task_id)
+        if disk is not None:
+            if disk.status == "done":
+                return {"task_id": task_id, "status": "done", "result": disk.result}
+            if disk.status in ("error", "stale"):
+                return {"task_id": task_id, "status": disk.status,
+                        "error": disk.error,
+                        "result": disk.result}
+        return {"task_id": task_id, "status": "unknown",
+                "error": "no such task_id (may have been GC'd or never existed)"}
+
+    # ── 0.4.0: legacy sync `prompt()` method deleted. ──
+    # Callers must use submit_prompt_async + get_result (or the `run`
+    # convenience tool which does both). Each MCP request is now
+    # millisecond-scale; per-request client timeouts no longer matter.
 
     def status(self) -> dict:
         alive = self.proc.poll() is None
-        return {
+        out = {
             "alive": alive, "codebuddy_pid": self.pid if alive else None,
             "acp_session_id": self.session_id, "model": self.last_model,
             "started_at": self.started_at, "uptime_s": round(time.time() - self.started_at, 1),
             "call_count": self.call_count, "last_call_at": self.last_call_at,
             "last_cache_ratio": self.last_cache_ratio, "totals": dict(self.totals),
         }
+        # 0.4.0 in-flight surface: the async API uses these for polling.
+        with self._task_lock:
+            if self._inflight is not None:
+                out["inflight_task_id"] = self._inflight.task_id
+                out["inflight_submitted_at"] = self._inflight.submitted_at
+                out["inflight_elapsed_s"] = _safe_elapsed(self._inflight.submitted_at)
+        return out
 
     def list_tasks(self, limit: int = 10) -> list[dict]:
         if limit <= 0: return []
@@ -481,8 +815,26 @@ class ACPSession:
         # this implicitly, but the explicit clamp here makes the doc claim
         # match the code (NOTE #7).
         if limit > 50: limit = 50
+        # 0.4.0: merge the in-memory audit-log deque (most recent
+        # completed) with the in-flight task (if any). Disk-persisted
+        # tasks from previous wrapper processes are not surfaced here —
+        # callers wanting history use get_result with a known task_id.
         items = list(self._tasks)[-limit:]
         items.reverse()
+        with self._task_lock:
+            inflight = self._inflight
+        if inflight is not None:
+            inflight_entry = {
+                "idx": None,  # not yet counted in call_count
+                "task_id": inflight.task_id,
+                "ts": inflight.submitted_at,
+                "text_preview": inflight.text_preview,
+                "model": inflight.model,
+                "status": "running",
+                "duration_s": _safe_elapsed(inflight.submitted_at),
+            }
+            items = [inflight_entry] + items
+            items = items[:limit]
         return items
 
     def close(self):
@@ -646,33 +998,84 @@ def _prompt_props() -> dict:
     }
 
 
-TOOL_PROMPT = Tool(
-    name="prompt",
-    description=("Send a one-shot text prompt to codebuddy (a peer LLM). Use for translation, summarization, design review, brainstorming, second opinion, or fresh implementation drafts. The wrapper keeps a single codebuddy subprocess alive so cache stays hot; per-call cost after the first is ~150-300 conversation tokens. Returns the assistant message plus a metadata tail with pid / model / tokens / cache_ratio. Triggers: 'ask codebuddy', '用 codebuddy', '让 codebuddy', 'summarize/review/translate with codebuddy'."),
-    inputSchema={"type": "object", "properties": _prompt_props(), "required": ["text"]},
+def _submit_props() -> dict:
+    """inputSchema for the submit-only tools. No `timeout` here: submit
+    returns in milliseconds; the wait happens on get_result."""
+    return {
+        "text": {"type": "string", "description": "The prompt / task description to send to codebuddy."},
+        "model": {"type": "string",
+                  "description": "Optional codebuddy model id (e.g. 'hy3', 'deepseek-v4-flash'). Use `list_models` to enumerate valid ids. Switching models is dynamic via `session/set_config_option` (preserves session_id, cache, and turn history) — no subprocess restart in the normal path."},
+        "append_system_prompt": {"type": "string",
+                                 "description": "Optional business rules / context appended to the mcode base system prompt. First call applies; subsequent changes trigger a subprocess respawn so the new append takes effect."},
+        "include_thinking": {"type": "boolean",
+                             "description": "If true, include the model's reasoning trace (`agent_thought_chunk` stream) in the response. Off by default — a long task can produce hundreds of thought chunks. Default false."},
+    }
+
+
+# 0.4.0 async submit/poll API — 7 tools total. The submit tools
+# return immediately with a task_id; get_result fetches the result.
+# `run` is the convenience wrapper for the common case (submit + blocking
+# get_result, in one call).
+
+TOOL_SUBMIT_PROMPT = Tool(
+    name="submit_prompt",
+    description=("Submit a codebuddy call and return immediately with a task_id (milliseconds). The actual codebuddy subprocess work runs in a background thread; fetch the result later via `get_result`. Use this when you want to dispatch a long-running codebuddy call without holding the MCP request open (which is what the 0.4.0 async API is for: the MCP client has a per-request timeout, so a synchronous codebuddy call that runs longer than the client's limit is silently dropped)."),
+    inputSchema={"type": "object", "properties": _submit_props(), "required": ["text"]},
 )
-TOOL_CONTINUE = Tool(
-    name="continue",
-    description=("Continue the same codebuddy conversation with a follow-up message. Functionally identical to `prompt` — codebuddy keeps server-side history by sessionId so subsequent calls are auto-continued — but exposed as a distinct tool so the caller's intent is explicit in the MCP trace. Triggers: 'ask codebuddy follow-up', '让 codebuddy 继续', 'codebuddy 然后'."),
-    inputSchema={"type": "object", "properties": _prompt_props(), "required": ["text"]},
+TOOL_SUBMIT_CONTINUE = Tool(
+    name="submit_continue",
+    description=("Continue a previously submitted codebuddy conversation with a follow-up message. Functionally identical to `submit_prompt` — codebuddy keeps server-side history by sessionId so subsequent calls are auto-continued — but exposed as a distinct tool so the caller's intent is explicit in the MCP trace. Returns a task_id immediately."),
+    inputSchema={"type": "object", "properties": _submit_props(), "required": ["text"]},
+)
+TOOL_GET_RESULT = Tool(
+    name="get_result",
+    description=("Fetch the result of a previously submitted task by task_id. mode='blocking' (default) waits up to wait_timeout_s for completion; mode='poll' returns the current state immediately. default wait_timeout_s=3600 (1h). Returns `{task_id, status: 'running'|'done'|'error'|'stale'|'unknown', result?, error?}`."),
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": "The task_id returned by submit_prompt or submit_continue."},
+            "wait_timeout_s": {"type": "integer", "default": 3600,
+                               "description": "For mode='blocking': seconds to wait for the task to complete before returning 'running' state. 0 = no wait. default 3600 (1h)."},
+            "mode": {"type": "string", "default": "blocking", "enum": ["blocking", "poll"],
+                     "description": "'blocking' waits up to wait_timeout_s; 'poll' returns current state immediately."},
+        },
+        "required": ["task_id"],
+    },
+)
+TOOL_RUN = Tool(
+    name="run",
+    description=("Convenience tool: submit a codebuddy call and block until the result is ready (internally does submit + blocking get_result). Use this for the common case where the caller is OK holding an MCP request for the duration of the codebuddy call. default wait_timeout_s=3600 (1h). The MCP request itself only holds the wait_timeout_s window — NOT the codebuddy call's own runtime, which is bounded by `ACPSession.timeout` (1h). For truly long calls (>1h), use submit_prompt + get_result separately so a brief MCP request can poll for the result."),
+    inputSchema={
+        "type": "object",
+        "properties": {
+            **{
+                k: v for k, v in _submit_props().items()
+                # submit-only fields (no `timeout` on submit; get_result owns waiting)
+            },
+            "wait_timeout_s": {"type": "integer", "default": 3600,
+                               "description": "Max seconds to block waiting for the result. default 3600 (1h). The MCP request only holds this window, not the codebuddy call's own runtime."},
+        },
+        "required": ["text"],
+    },
 )
 TOOL_STATUS = Tool(
     name="status",
-    description=("Return the current wrapper + codebuddy subprocess state: liveness, pid, ACP session id, model, uptime, call_count, last_call timestamp, last cache_ratio, cumulative token totals. No side effects. Use for diagnostics or to confirm a long-running wrapper is still healthy before the next call."),
+    description=("Return the current wrapper + codebuddy subprocess state: liveness, pid, ACP session id, model, uptime, call_count, last_call timestamp, last cache_ratio, cumulative token totals, in-flight task_id (if any). No side effects. Use for diagnostics or to confirm a long-running wrapper is still healthy before the next call."),
     inputSchema={"type": "object", "properties": {}, "additionalProperties": False},
 )
 TOOL_LIST_TASKS = Tool(
     name="list_tasks",
-    description=("Return the most recent N call metadata records (most recent first). Each record has: idx, ts, text_preview, model, duration_s, prompt_tokens, completion_tokens, cached_tokens, cache_ratio, stop_reason. Use to inspect what the wrapper has done in this mcode session without grepping the log file."),
+    description=("Return the most recent N call metadata records (most recent first), plus the current in-flight task (if any). Each record has: idx, ts, text_preview, model, duration_s, prompt_tokens, completion_tokens, cached_tokens, cache_ratio, stop_reason. Use to inspect what the wrapper has done in this mcode session without grepping the log file."),
     inputSchema={"type": "object", "properties": {"limit": {"type": "integer", "description": "Max records to return (default 10, max 50)."}}, "additionalProperties": False},
 )
 TOOL_LIST_MODELS = Tool(
     name="list_models",
-    description=("List codebuddy's supported model IDs. Reads from the live ACP session's `models.availableModels` (rich: per-model credits / maxInputTokens / supportsReasoning); falls back to parsing `codebuddy --help` only if no session is live yet. Use this before passing a `model=` argument to `prompt` / `continue` to verify the model id is valid (e.g. `deepseek-v4-flash`, `hy3`). Returns `{ok, models: [id, ...], count, source}` plus a `rich` array with per-model metadata on success; `{ok: false, error, ...}` on failure. Cached per process."),
+    description=("List codebuddy's supported model IDs. Reads from the live ACP session's `models.availableModels` (rich: per-model credits / maxInputTokens / supportsReasoning); falls back to parsing `codebuddy --help` only if no session is live yet. Use this before passing a `model=` argument to verify the model id is valid (e.g. `deepseek-v4-flash`, `hy3`). Returns `{ok, models: [id, ...], count, source}` plus a `rich` array with per-model metadata on success; `{ok: false, error, ...}` on failure. Cached per process."),
     inputSchema={"type": "object", "properties": {}, "additionalProperties": False},
 )
 
-ALL_TOOLS = [TOOL_PROMPT, TOOL_CONTINUE, TOOL_STATUS, TOOL_LIST_TASKS, TOOL_LIST_MODELS]
+ALL_TOOLS = [TOOL_SUBMIT_PROMPT, TOOL_SUBMIT_CONTINUE, TOOL_GET_RESULT, TOOL_RUN,
+             TOOL_STATUS, TOOL_LIST_TASKS, TOOL_LIST_MODELS]
 
 
 async def _list_tools(ctx, params):
@@ -710,18 +1113,56 @@ def _format_result(result: dict) -> str:
 async def _call_tool(ctx, params):
     name = getattr(params, "name", None) or (params.get("name") if isinstance(params, dict) else None)
     arguments = (getattr(params, "arguments", None) or (params.get("arguments") if isinstance(params, dict) else {}) or {})
-    if name in ("prompt", "continue"):
+    # 0.4.0 async API: submit returns immediately, get_result polls,
+    # run is the convenience wrapper. Each MCP request is millisecond-scale.
+    if name in ("submit_prompt", "submit_continue"):
         text = arguments.get("text")
         if not text:
             raise ValueError(f"{name}: missing required arg: text")
         sess = get_session()
-        result = sess.prompt(
+        rec = sess.submit_prompt_async(
             text=text, model=arguments.get("model"),
             append_system_prompt=arguments.get("append_system_prompt"),
             include_thinking=bool(arguments.get("include_thinking", False)),
-            timeout=arguments.get("timeout"),
         )
-        return CallToolResult(content=[TextContent(type="text", text=_format_result(result))])
+        return CallToolResult(content=[TextContent(type="text",
+            text=json.dumps(rec, ensure_ascii=False))])
+    if name == "get_result":
+        task_id = arguments.get("task_id")
+        if not task_id:
+            raise ValueError("get_result: missing required arg: task_id")
+        sess = get_session()
+        wait = int(arguments.get("wait_timeout_s", 3600))
+        mode = arguments.get("mode", "blocking")
+        if mode not in ("blocking", "poll"):
+            raise ValueError(f"get_result: invalid mode {mode!r}; must be 'blocking' or 'poll'")
+        result = sess.get_result(task_id, wait_timeout_s=wait, mode=mode)
+        return CallToolResult(content=[TextContent(type="text",
+            text=json.dumps(result, ensure_ascii=False))])
+    if name == "run":
+        text = arguments.get("text")
+        if not text:
+            raise ValueError("run: missing required arg: text")
+        sess = get_session()
+        sub = sess.submit_prompt_async(
+            text=text, model=arguments.get("model"),
+            append_system_prompt=arguments.get("append_system_prompt"),
+            include_thinking=bool(arguments.get("include_thinking", False)),
+        )
+        if sub.get("status") == "busy":
+            return CallToolResult(content=[TextContent(type="text",
+                text=json.dumps(sub, ensure_ascii=False))])
+        wait = int(arguments.get("wait_timeout_s", 3600))
+        result = sess.get_result(sub["task_id"], wait_timeout_s=wait, mode="blocking")
+        if result.get("status") == "done":
+            # Format like the old sync result so callers can pipe the
+            # output directly into their next step.
+            return CallToolResult(content=[TextContent(type="text",
+                text=_format_result(result["result"]))])
+        # Error / stale / unknown: return the structured result so the
+        # caller sees what went wrong.
+        return CallToolResult(content=[TextContent(type="text",
+            text=json.dumps(result, ensure_ascii=False))])
     if name == "status":
         sess = get_session()
         st = sess.status()
@@ -745,6 +1186,14 @@ async def main():
 
 
 if __name__ == "__main__":
+    # 0.4.0: at startup, mark any "running" task files as "stale" — they
+    # were left in-flight by a previous wrapper process that died. GC also
+    # drops completed task files older than TASK_LIFETIME_S to keep the
+    # dir bounded. This is best-effort: a read-only install silently no-ops.
+    try:
+        _gc_orphan_tasks()
+    except Exception:
+        pass
     try: asyncio.run(main())
     except KeyboardInterrupt: pass
     finally:

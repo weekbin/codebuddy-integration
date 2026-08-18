@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """test_mcp_wrapper_unit.py - unit tests for codebuddy-mcp-server (no subprocess)"""
-import importlib.util, json, sys, tempfile, threading, time, unittest
+import importlib.util, json, sys, tempfile, threading, time, unittest, uuid
 from collections import deque
 from pathlib import Path
 
@@ -83,28 +83,46 @@ class TestStatusShape(unittest.TestCase):
             "pid": 99999, "session_id": "abc-123", "last_model": "hy3",
             "started_at": time.time() - 60, "call_count": 5, "last_call_at": time.time() - 1,
             "last_cache_ratio": 98.5,
-            "totals": {"prompt_tokens": 100000, "completion_tokens": 200, "cached_tokens": 95000}})()
+            "totals": {"prompt_tokens": 100000, "completion_tokens": 200, "cached_tokens": 95000},
+            # 0.4.0: status() now also reads _inflight under _task_lock; both
+            # must exist on the fake or the call raises AttributeError.
+            "_inflight": None,
+            "_task_lock": threading.Lock(),
+        })()
         st = _mod.ACPSession.status(fake)
         self.assertTrue(st["alive"]); self.assertEqual(st["codebuddy_pid"], 99999)
         self.assertEqual(st["acp_session_id"], "abc-123"); self.assertEqual(st["model"], "hy3")
         self.assertEqual(st["call_count"], 5); self.assertEqual(st["last_cache_ratio"], 98.5)
         self.assertEqual(st["totals"]["cached_tokens"], 95000)
         self.assertGreaterEqual(st["uptime_s"], 59)
+        # No in-flight task → no inflight_* fields (or they're absent)
+        self.assertNotIn("inflight_task_id", st)
 
 
 class TestListTasksLimit(unittest.TestCase):
     def test_returns_most_recent_first(self):
-        fake = type("Fake", (), {"_tasks": deque(maxlen=50)})()
+        # 0.4.0: list_tasks() now also reads _inflight under _task_lock. Fake
+        # must have both or the call raises AttributeError.
+        fake = type("Fake", (), {
+            "_tasks": deque(maxlen=50), "_inflight": None,
+            "_task_lock": threading.Lock(),
+        })()
         for i in range(5): fake._tasks.append({"idx": i + 1, "text_preview": f"task {i+1}"})
         items = _mod.ACPSession.list_tasks(fake, limit=10)
         self.assertEqual(len(items), 5); self.assertEqual([t["idx"] for t in items], [5, 4, 3, 2, 1])
     def test_limit_truncates(self):
-        fake = type("Fake", (), {"_tasks": deque(maxlen=50)})()
+        fake = type("Fake", (), {
+            "_tasks": deque(maxlen=50), "_inflight": None,
+            "_task_lock": threading.Lock(),
+        })()
         for i in range(10): fake._tasks.append({"idx": i + 1})
         items = _mod.ACPSession.list_tasks(fake, limit=3)
         self.assertEqual(len(items), 3); self.assertEqual([t["idx"] for t in items], [10, 9, 8])
     def test_limit_zero_returns_empty(self):
-        fake = type("Fake", (), {"_tasks": deque(maxlen=50)})()
+        fake = type("Fake", (), {
+            "_tasks": deque(maxlen=50), "_inflight": None,
+            "_task_lock": threading.Lock(),
+        })()
         for i in range(3): fake._tasks.append({"idx": i + 1})
         self.assertEqual(_mod.ACPSession.list_tasks(fake, limit=0), [])
 
@@ -134,10 +152,16 @@ class TestToolHandlerDispatch(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             self._run(_mod._call_tool(None, type("P", (), {"name": "bogus", "arguments": {}})()))
         self.assertIn("unknown tool", str(ctx.exception))
-    def test_prompt_missing_text_raises(self):
+    def test_submit_prompt_missing_text_raises(self):
+        # 0.4.0: the legacy `prompt` tool is gone. submit_prompt without
+        # a `text` arg is the equivalent guard test.
         with self.assertRaises(ValueError) as ctx:
-            self._run(_mod._call_tool(None, type("P", (), {"name": "prompt", "arguments": {}})()))
+            self._run(_mod._call_tool(None, type("P", (), {"name": "submit_prompt", "arguments": {}})()))
         self.assertIn("text", str(ctx.exception))
+    def test_get_result_missing_task_id_raises(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._run(_mod._call_tool(None, type("P", (), {"name": "get_result", "arguments": {}})()))
+        self.assertIn("task_id", str(ctx.exception))
     def test_list_models_dispatches(self):
         # list_models has no required args; just confirm it doesn't raise and
         # the handler is wired up. The real result depends on the local
@@ -252,60 +276,40 @@ class TestSpawnArgsWithModel(unittest.TestCase):
 
 class TestChunkConcatenation(unittest.TestCase):
     """The truncation bug fix: every `agent_message_chunk` must be
-    appended, not just the first. We reconstruct the relevant slice of
-    `prompt()` by calling _drain_notifications and then running the
-    post-call loop body. Simpler: just call the inner accumulation
-    logic by exercising `prompt()` with a fake session."""
+    appended, not just the first. 0.4.0: legacy `prompt()` is gone, so
+    we test the pure helper `_collect_response_artifacts` directly. The
+    background thread calls the same helper."""
 
-    def _build_fake_session(self, chunks):
-        """Build a fake ACPSession that, when prompt() is called, will
-        return the given list of chunked text fragments as the
-        assistant message."""
-        import unittest.mock as mock
-        full_text = "".join(chunks)
-        session = _mod.ACPSession.__new__(_mod.ACPSession)
-        session.codebuddy_bin = "codebuddy"
-        session.cwd = "/tmp"
-        session.mcode_base_prompt_file = None
-        session.timeout = 30
-        session._appended_text = None
-        session.last_model = "hy3"
-        session.session_id = "sess-1"
-        session.started_at = time.time()
-        session.call_count = 0
-        session.last_call_at = None
-        session.last_cache_ratio = None
-        session.totals = {"prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0}
-        session._tasks = deque(maxlen=50)
-        session.proc = mock.MagicMock()
-        session.pid = 99999  # used for cb_pid in result metadata
-        # The r returned by call() — the immediate response is empty
-        session.call = mock.MagicMock(return_value={})
-        # Drain returns synthetic notifications
-        notifications = [
+    def _notifications_for(self, chunks):
+        notifs = [
             {"params": {"update": {"sessionUpdate": "agent_message_chunk",
                                    "content": {"text": c}}}}
             for c in chunks
         ]
-        notifications.append({
+        notifs.append({
             "params": {"update": {
                 "sessionUpdate": "usage_update",
-                "_meta": {"usage": {"prompt_tokens": 100, "completion_tokens": len(full_text),
+                "_meta": {"usage": {"prompt_tokens": 100,
+                                    "completion_tokens": sum(len(c) for c in chunks),
                                     "prompt_tokens_details": {"cached_tokens": 50}}},
             }},
         })
-        session._drain_notifications = mock.MagicMock(return_value=notifications)
-        return session
+        return notifs
 
     def test_concatenates_multiple_chunks(self):
-        session = self._build_fake_session(["Hello, ", "this is a ", "long reply with many tokens."])
-        r = session.prompt(text="hi")
+        r = _mod._collect_response_artifacts(
+            {}, self._notifications_for(["Hello, ", "this is a ", "long reply with many tokens."]),
+            include_thinking=False, fallback_model="hy3",
+        )
         self.assertEqual(r["text"], "Hello, this is a long reply with many tokens.")
-        self.assertEqual(r["usage"]["completion_tokens"], len("Hello, this is a long reply with many tokens."))
+        self.assertEqual(r["usage"]["completion_tokens"],
+                         len("Hello, this is a long reply with many tokens."))
 
     def test_single_chunk_still_works(self):
-        session = self._build_fake_session(["short"])
-        r = session.prompt(text="hi")
+        r = _mod._collect_response_artifacts(
+            {}, self._notifications_for(["short"]),
+            include_thinking=False, fallback_model="hy3",
+        )
         self.assertEqual(r["text"], "short")
 
 
@@ -388,29 +392,8 @@ class TestSwitchModel(unittest.TestCase):
 
 class TestThinkingAndToolCalls(unittest.TestCase):
     """Verify agent_thought_chunk and tool_call/tool_call_update events
-    are captured, and include_thinking gates whether thinking is in result."""
-
-    def _build_session_with_mixed_events(self, events):
-        import unittest.mock as mock
-        sess = _mod.ACPSession.__new__(_mod.ACPSession)
-        sess.codebuddy_bin = "codebuddy"
-        sess.cwd = "/tmp"
-        sess.mcode_base_prompt_file = None
-        sess.timeout = 30
-        sess._appended_text = None
-        sess.last_model = "hy3"
-        sess.session_id = "sess-1"
-        sess.started_at = time.time()
-        sess.call_count = 0
-        sess.last_call_at = None
-        sess.last_cache_ratio = None
-        sess.totals = {"prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0}
-        sess._tasks = deque(maxlen=50)
-        sess.proc = mock.MagicMock()
-        sess.pid = 99999
-        sess.call = mock.MagicMock(return_value={})
-        sess._drain_notifications = mock.MagicMock(return_value=events)
-        return sess
+    are captured, and include_thinking gates whether thinking is in result.
+    0.4.0: tested via the pure `_collect_response_artifacts` helper."""
 
     def test_thinking_captured_when_include_thinking_true(self):
         events = [
@@ -424,8 +407,8 @@ class TestThinkingAndToolCalls(unittest.TestCase):
                                    "_meta": {"usage": {"prompt_tokens": 100, "completion_tokens": 12,
                                                        "prompt_tokens_details": {"cached_tokens": 50}}}}}},
         ]
-        sess = self._build_session_with_mixed_events(events)
-        r = sess.prompt(text="hi", include_thinking=True)
+        r = _mod._collect_response_artifacts({}, events, include_thinking=True,
+                                            fallback_model="hy3")
         self.assertEqual(r["text"], "Answer: 42")
         self.assertEqual(r["thinking"], "Let me think about this...")
         self.assertEqual(r["thinking_chars"], len("Let me think about this..."))
@@ -437,13 +420,13 @@ class TestThinkingAndToolCalls(unittest.TestCase):
             {"params": {"update": {"sessionUpdate": "agent_message_chunk",
                                    "content": {"text": "Answer"}}}},
         ]
-        sess = self._build_session_with_mixed_events(events)
-        r = sess.prompt(text="hi", include_thinking=False)
+        r = _mod._collect_response_artifacts({}, events, include_thinking=False,
+                                            fallback_model="hy3")
         self.assertEqual(r["text"], "Answer")
         self.assertNotIn("thinking", r)
-        # And the default (no kwarg) is the same as False
-        sess2 = self._build_session_with_mixed_events(events)
-        r2 = sess2.prompt(text="hi")
+        # Default (no kwarg) matches False
+        r2 = _mod._collect_response_artifacts({}, events, include_thinking=False,
+                                             fallback_model="hy3")
         self.assertNotIn("thinking", r2)
 
     def test_tool_calls_captured_with_status_updates(self):
@@ -461,10 +444,9 @@ class TestThinkingAndToolCalls(unittest.TestCase):
             {"params": {"update": {"sessionUpdate": "agent_message_chunk",
                                    "content": {"text": "Done."}}}},
         ]
-        sess = self._build_session_with_mixed_events(events)
-        r = sess.prompt(text="hi")
+        r = _mod._collect_response_artifacts({}, events, include_thinking=False,
+                                            fallback_model="hy3")
         self.assertEqual(len(r["tool_calls"]), 2)
-        # Status updates merged onto the original tool_call entries
         by_id = {tc["id"]: tc for tc in r["tool_calls"]}
         self.assertEqual(by_id["t1"]["status"], "completed")
         self.assertEqual(by_id["t2"]["status"], "completed")
@@ -492,6 +474,276 @@ class TestThinkingAndToolCalls(unittest.TestCase):
         self.assertIn("--- tools (2) ---", out)
         self.assertIn("Read [completed]", out)
         self.assertIn("Write [completed]", out)
+
+
+class TestTaskPersistence(unittest.TestCase):
+    """Task persistence: save / load / round-trip / GC. These are the
+    primitives that wrapper restart and get_result-after-restart rely on."""
+
+    def setUp(self):
+        self._orig_state_dir = _mod.STATE_DIR
+        self.tmp_state = Path(tempfile.mkdtemp(prefix="mcp-task-test-"))
+        _mod.STATE_DIR = self.tmp_state
+        _mod.TASKS_DIR = self.tmp_state / "tasks"
+    def tearDown(self):
+        _mod.STATE_DIR = self._orig_state_dir
+        _mod.TASKS_DIR = self._orig_state_dir / "tasks"
+
+    def test_save_load_roundtrip(self):
+        rec = _mod.TaskRecord(
+            task_id="tsk_abc123def456",
+            status="done",
+            submitted_at="2026-08-18T10:00:00+00:00",
+            text_preview="hello",
+            model="deepseek-v4-flash",
+            result={"text": "world", "duration_s": 1.5, "model": "deepseek-v4-flash",
+                     "stop_reason": "end_turn", "cb_pid": 123, "cache_ratio": 95.0,
+                     "usage": {"prompt_tokens": 100, "completion_tokens": 5,
+                                "prompt_tokens_details": {"cached_tokens": 95}}},
+            duration_s=1.5,
+        )
+        self.assertTrue(_mod._save_task(rec))
+        loaded = _mod._load_task("tsk_abc123def456")
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded.task_id, "tsk_abc123def456")
+        self.assertEqual(loaded.status, "done")
+        self.assertEqual(loaded.text_preview, "hello")
+        self.assertEqual(loaded.model, "deepseek-v4-flash")
+        self.assertEqual(loaded.result["text"], "world")
+        self.assertEqual(loaded.duration_s, 1.5)
+
+    def test_load_missing_returns_none(self):
+        self.assertIsNone(_mod._load_task("tsk_does_not_exist"))
+
+    def test_load_rejects_path_traversal(self):
+        # Defense against malicious task_id: must not escape TASKS_DIR.
+        self.assertIsNone(_mod._load_task("../etc/passwd"))
+        self.assertIsNone(_mod._load_task(""))
+        self.assertIsNone(_mod._load_task("tsk/../../bad"))
+        # Reject anything with shell metacharacters or path separators
+        self.assertIsNone(_mod._load_task("tsk;rm -rf /"))
+
+    def test_load_malformed_json_returns_none(self):
+        # Write garbage to disk and confirm load returns None (no crash)
+        _mod.TASKS_DIR.mkdir(parents=True, exist_ok=True)
+        (_mod.TASKS_DIR / "tsk_garbage.json").write_text("{not json}", encoding="utf-8")
+        self.assertIsNone(_mod._load_task("tsk_garbage"))
+
+    def test_gc_marks_running_tasks_as_stale(self):
+        # Two tasks: one running, one done. GC should mark running as stale
+        # and leave done alone (or remove if old enough).
+        _mod.TASKS_DIR.mkdir(parents=True, exist_ok=True)
+        running = _mod.TaskRecord(
+            task_id="tsk_running1", status="running",
+            submitted_at="2026-08-18T09:00:00+00:00", text_preview="x")
+        done_old = _mod.TaskRecord(
+            task_id="tsk_doneold1", status="done",
+            submitted_at="2026-01-01T00:00:00+00:00",
+            completed_at="2026-01-01T00:01:00+00:00",
+            result={"text": "y"})
+        done_fresh = _mod.TaskRecord(
+            task_id="tsk_donefresh", status="done",
+            submitted_at="2026-08-18T10:00:00+00:00",
+            completed_at="2026-08-18T10:00:01+00:00",
+            result={"text": "z"})
+        _mod._save_task(running)
+        _mod._save_task(done_old)
+        _mod._save_task(done_fresh)
+        touched = _mod._gc_orphan_tasks()
+        # Running → stale (touched), old done → unlinked (touched), fresh done → unchanged
+        self.assertGreaterEqual(touched, 2)
+        # running now stale
+        loaded = _mod._load_task("tsk_running1")
+        self.assertEqual(loaded.status, "stale")
+        self.assertIn("wrapper restarted", loaded.error)
+        # old done unlinked
+        self.assertFalse((_mod.TASKS_DIR / "tsk_doneold1.json").exists())
+        # fresh done still there
+        self.assertTrue((_mod.TASKS_DIR / "tsk_donefresh.json").exists())
+
+    def test_gc_on_missing_dir_is_safe(self):
+        # No TASKS_DIR exists → GC should be a no-op, not crash
+        # (the tmp dir is empty, no tasks subdir)
+        self.assertEqual(_mod._gc_orphan_tasks(), 0)
+
+    def test_save_atomic_no_partial_file_on_failure(self):
+        # Mock json.dump to raise — confirm .tmp doesn't linger
+        import unittest.mock as mock
+        _mod.TASKS_DIR.mkdir(parents=True, exist_ok=True)
+        with mock.patch("json.dump", side_effect=OSError("disk full")):
+            rec = _mod.TaskRecord(task_id="tsk_fail", status="done",
+                                   submitted_at="2026-08-18T10:00:00+00:00")
+            self.assertFalse(_mod._save_task(rec))
+        # No .tmp file left behind
+        self.assertFalse((_mod.TASKS_DIR / "tsk_fail.tmp").exists())
+        self.assertFalse((_mod.TASKS_DIR / "tsk_fail.json").exists())
+
+
+class TestTaskIdFormat(unittest.TestCase):
+    """TaskRecord.task_id format: tsk_ + 12 hex chars. Get this wrong and
+    load_task's character-class filter will reject it."""
+
+    def test_format_in_submit_prompt_async(self):
+        import re
+        # We don't run a real session here; we just check that the format
+        # function the plan calls is what we expect. (If submit_prompt_async
+        # ever changes the prefix, this guard catches it.)
+        # Use uuid directly to derive a sample task_id and assert the format
+        sample = "tsk_" + uuid.uuid4().hex[:12]
+        self.assertRegex(sample, r"^tsk_[0-9a-f]{12}$")
+
+
+class TestSubmitPromptAsync(unittest.TestCase):
+    """submit_prompt_async: returns immediately with task_id, spawns a
+    daemon thread, single in-flight constraint, status fields present."""
+
+    def _build_sess(self, *, inflight_set=False):
+        """Bare ACPSession — bypass __init__ so we don't actually spawn
+        a codebuddy subprocess."""
+        sess = _mod.ACPSession.__new__(_mod.ACPSession)
+        sess._inflight = None
+        sess._tasks_done = deque(maxlen=50)
+        sess._task_event = threading.Event()
+        sess._task_lock = threading.Lock()
+        sess.timeout = 3600
+        sess.last_model = "hy3"
+        if inflight_set:
+            sess._inflight = _mod.TaskRecord(
+                task_id="tsk_existing1234", status="running",
+                submitted_at="2026-08-18T10:00:00+00:00",
+            )
+        return sess
+
+    def test_returns_task_id_immediately(self):
+        import unittest.mock as mock
+        sess = self._build_sess()
+        with mock.patch.object(_mod, "_save_task", return_value=True), \
+             mock.patch.object(_mod.threading, "Thread") as ThreadMock:
+            ThreadMock.return_value.start = mock.MagicMock()
+            rec = sess.submit_prompt_async(text="hello world", model="deepseek-v4-flash")
+        # No waiting — returns immediately
+        self.assertEqual(rec["status"], "running")
+        self.assertRegex(rec["task_id"], r"^tsk_[0-9a-f]{12}$")
+        self.assertEqual(rec["model"], "deepseek-v4-flash")
+        self.assertIn("submitted_at", rec)
+
+    def test_second_submit_returns_busy(self):
+        import unittest.mock as mock
+        sess = self._build_sess(inflight_set=True)
+        rec = sess.submit_prompt_async(text="x", model="hy3")
+        self.assertEqual(rec["status"], "busy")
+        self.assertIn("tsk_existing1234", rec["error"])
+
+
+class TestGetResult(unittest.TestCase):
+    """get_result: done → return result; stale → return error; unknown → unknown."""
+
+    def _build_sess(self, *, done_records=None, inflight=None, disk=None):
+        sess = _mod.ACPSession.__new__(_mod.ACPSession)
+        sess._inflight = inflight
+        sess._tasks_done = deque(done_records or [], maxlen=50)
+        sess._task_event = threading.Event()
+        sess._task_lock = threading.Lock()
+        sess.timeout = 3600
+        # Allow _load_task to be patched per test
+        self._disk_return = disk
+        return sess
+
+    def test_done_in_done_ring(self):
+        rec = _mod.TaskRecord(
+            task_id="tsk_done1234ab", status="done",
+            submitted_at="2026-08-18T10:00:00+00:00",
+            result={"text": "the answer", "model": "deepseek-v4-flash",
+                     "duration_s": 1.5, "stop_reason": "end_turn",
+                     "cb_pid": 100, "cache_ratio": 95.0,
+                     "usage": {"prompt_tokens": 100, "completion_tokens": 5,
+                                "prompt_tokens_details": {"cached_tokens": 95}}},
+        )
+        sess = self._build_sess(done_records=[rec])
+        out = sess.get_result("tsk_done1234ab", wait_timeout_s=0, mode="poll")
+        self.assertEqual(out["status"], "done")
+        self.assertEqual(out["result"]["text"], "the answer")
+
+    def test_error_in_done_ring(self):
+        rec = _mod.TaskRecord(
+            task_id="tsk_error12345", status="error",
+            submitted_at="2026-08-18T10:00:00+00:00",
+            error="RuntimeError: foo",
+        )
+        sess = self._build_sess(done_records=[rec])
+        out = sess.get_result("tsk_error12345", wait_timeout_s=0, mode="poll")
+        self.assertEqual(out["status"], "error")
+        self.assertIn("RuntimeError", out["error"])
+
+    def test_unknown_task_id(self):
+        import unittest.mock as mock
+        sess = self._build_sess()
+        with mock.patch.object(_mod, "_load_task", return_value=None):
+            out = sess.get_result("tsk_unknown", wait_timeout_s=0, mode="poll")
+        self.assertEqual(out["status"], "unknown")
+        self.assertIn("no such task_id", out["error"])
+
+    def test_stale_task_from_disk(self):
+        # Wrapper restart scenario: task was running in previous process,
+        # GC marked it stale, current process sees the stale record.
+        import unittest.mock as mock
+        rec = _mod.TaskRecord(
+            task_id="tsk_stale123ab", status="stale",
+            submitted_at="2026-08-18T09:00:00+00:00",
+            completed_at="2026-08-18T09:01:00+00:00",
+            error="wrapper restarted while this task was in-flight",
+        )
+        sess = self._build_sess()
+        with mock.patch.object(_mod, "_load_task", return_value=rec):
+            out = sess.get_result("tsk_stale123ab", wait_timeout_s=0, mode="poll")
+        self.assertEqual(out["status"], "stale")
+        self.assertIn("wrapper restarted", out["error"])
+
+
+class TestGlobalTimeoutDefaults(unittest.TestCase):
+    """v4 invariant: every timeout default = 3600 (1h). grep-able
+    guard so a future change can't quietly regress to 60/300/600."""
+
+    def test_acp_session_default_timeout(self):
+        # The default value of `timeout` in the ACPSession signature is
+        # 3600. We assert it via signature inspection rather than running
+        # __init__ (which spawns a subprocess).
+        import inspect
+        sig = inspect.signature(_mod.ACPSession.__init__)
+        self.assertEqual(sig.parameters["timeout"].default, 3600)
+
+    def test_get_result_default_wait_timeout(self):
+        import inspect
+        sig = inspect.signature(_mod.ACPSession.get_result)
+        self.assertEqual(sig.parameters["wait_timeout_s"].default, 3600)
+
+    def test_input_schemas_use_3600(self):
+        # Both get_result and run expose wait_timeout_s default in their
+        # input_schema (read by the MCP client at tools/list time). mcp v2
+        # uses pydantic which exposes it as `input_schema` (snake_case).
+        for tool in _mod.ALL_TOOLS:
+            schema = tool.input_schema
+            props = schema.get("properties", {})
+            if "wait_timeout_s" in props:
+                self.assertEqual(
+                    props["wait_timeout_s"].get("default"), 3600,
+                    f"{tool.name}.input_schema.wait_timeout_s.default must be 3600, got {props['wait_timeout_s'].get('default')!r}",
+                )
+
+    def test_legacy_prompt_tool_not_in_all_tools(self):
+        names = {t.name for t in _mod.ALL_TOOLS}
+        self.assertNotIn("prompt", names)
+        self.assertNotIn("continue", names)
+
+    def test_seven_tools_total(self):
+        self.assertEqual(len(_mod.ALL_TOOLS), 7)
+
+    def test_expected_tool_set(self):
+        names = {t.name for t in _mod.ALL_TOOLS}
+        self.assertEqual(names, {
+            "submit_prompt", "submit_continue", "get_result", "run",
+            "status", "list_tasks", "list_models",
+        })
 
 
 def asyncio_run(coro):

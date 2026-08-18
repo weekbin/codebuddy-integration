@@ -5,6 +5,11 @@
       "type": "stdio",
       "command": "./bin/codebuddy-mcp-server.py",
       "env": {
+        "MCP_SERVER_REQUEST_TIMEOUT": "3600000",
+        "MCP_REQUEST_TIMEOUT": "3600",
+        "MCP_CONNECTION_TIMEOUT": "3600",
+        "MCP_TIMEOUT": "3600",
+        "MCP_MAX_REQUEST_TIMEOUT": "3600000",
         "MCODE_BASE_PROMPT_FILE": "${PLUGIN_ROOT}/assets/mcode-base-system-prompt.md",
         "MCP_STATE_DIR": "${PLUGIN_DATA}/state"
       }

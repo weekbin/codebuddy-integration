@@ -28,13 +28,19 @@ async def main():
             tools_resp = await session.list_tools()
             names = [t.name for t in tools_resp.tools]
             print(f"✓ tools/list: {names}")
-            expected = {"prompt", "continue", "status", "list_tasks", "list_models"}
+            expected = {"submit_prompt", "submit_continue", "get_result",
+                        "run", "status", "list_tasks", "list_models"}
             assert set(names) == expected, f"expected {expected}, got {set(names)}"
             results = []
             for i in range(5):
                 prompt = f"用 5 个字说 hi，第 {i+1} 次调用 (PoC cache test)"
                 print(f"→ call {i+1}: {prompt!r}")
-                resp = await session.call_tool("prompt", {"text": prompt})
+                # 0.4.0: `run` is the convenience wrapper around submit_prompt
+                # + blocking get_result. Each MCP request is millisecond-scale
+                # on the submit side, then the wait_timeout_s window for the
+                # codebuddy call to finish.
+                resp = await session.call_tool("run", {"text": prompt,
+                                                         "wait_timeout_s": 180})
                 text = resp.content[0].text if resp.content else ""
                 meta = {}
                 for line in text.splitlines()[-3:]:

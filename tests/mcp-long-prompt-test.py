@@ -41,7 +41,9 @@ async def main() -> int:
         async with ClientSession(read, write) as session:
             await session.initialize()
             print("→ sending long prompt (LRU cache, ~800-1500 expected tokens)...")
-            r = await session.call_tool("prompt", {"text": PROMPT, "timeout": 180})
+            # 0.4.0: `run` is the convenience tool (submit + blocking
+            # get_result). wait_timeout_s=180 replaces the old `timeout=180`.
+            r = await session.call_tool("run", {"text": PROMPT, "wait_timeout_s": 180})
             text = r.content[0].text
             # Pull the metadata tail
             tok_m = re.search(r"prompt=(\d+), completion=(\d+)", text)
