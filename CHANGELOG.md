@@ -4,6 +4,14 @@ All notable changes to this plugin are documented in this file. The format is ba
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.6] - 2026-08-18
+
+### Fixed
+- **WARN #2: `STATE_DIR.mkdir` at module level crashed the wrapper on read-only `PLUGIN_ROOT`**. Application bundles, container images, and system-wide installs would refuse to start (spec §7.2.2 rule 5: one bad component kills the whole plugin). The mkdir is now lazy — only on first log write, inside a try/except. A read-only install silently drops log writes instead of refusing to start.
+- **WARN #2: state dir now respects `${PLUGIN_DATA}`** (spec §9.1). Plugin state should live in the per-client injected data dir, not inside `PLUGIN_ROOT`. mcp.json now sets `MCP_STATE_DIR: "${PLUGIN_DATA}/state"`. The wrapper reads it (falling back to `PLUGIN_ROOT/state` when unset or unexpanded) and the literal string `"${PLUGIN_DATA}/..."` is treated as unset so a non-conforming client doesn't accidentally create a dir with that name. State now survives plugin updates and is properly isolated per client.
+- **WARN #1: codebuddy reachability check now happens before spawn**. Before, a typo in `$PATH` would surface as a confusing `FileNotFoundError` from Popen on first prompt call. Now `_health_check_codebuddy` runs `codebuddy --version` (5s timeout) inside `get_session()` before the long-lived subprocess is started. Missing binary, non-zero exit, or hang → clear "set `CODEBUDDY_BIN` / install codebuddy" error message. Adds ~0.5-1s latency to first call after fresh session start (where the user already pays a model warmup cost).
+- **NOTE #7: `list_tasks` "max 50" was a doc-only claim**. The inputSchema description said "max 50" but the code had no explicit clamp (the cap came implicitly from the `_tasks` deque's `maxlen=50`). Now: explicit `if limit > 50: limit = 50` in `ACPSession.list_tasks`. Behavior was already correct, but the code now matches the doc.
+
 ## [0.3.5] - 2026-08-18
 
 ### Removed

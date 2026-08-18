@@ -33,8 +33,24 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent, ListToolsResult, CallToolResult
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
-STATE_DIR = PLUGIN_ROOT / "state"
-STATE_DIR.mkdir(parents=True, exist_ok=True)
+# State dir priority (Agent Plugins 1.0.0 spec §9.1):
+#   1. $MCP_STATE_DIR, which mcp.json sets from ${PLUGIN_DATA}/state — per-client
+#      injected data dir, survives plugin updates, isolated per install
+#   2. $PLUGIN_ROOT/state — fallback for clients that don't inject PLUGIN_DATA
+#      (older mcode, third-party clients). State shares fate with the plugin code.
+# The literal string "${PLUGIN_DATA}/..." (unexpanded) is treated as unset so a
+# non-conforming client doesn't accidentally create a dir called "${PLUGIN_DATA}".
+_env_state_dir = os.environ.get("MCP_STATE_DIR", "")
+if _env_state_dir and not _env_state_dir.startswith("${"):
+    STATE_DIR = Path(_env_state_dir)
+else:
+    STATE_DIR = PLUGIN_ROOT / "state"
+# NOTE: STATE_DIR.mkdir is intentionally NOT called at module level. A read-only
+# PLUGIN_ROOT (application bundle, container image, system-wide install) would
+# crash the wrapper at import time, taking down the whole plugin per spec §7.2.2
+# rule 5. The mkdir happens lazily on the first log write (see _log_line) inside
+# a try/except, so a read-only install silently drops log writes instead of
+# refusing to start.
 
 # ── structured logger ─────────────────────
 _log_lock = threading.Lock()
@@ -58,13 +74,19 @@ def _log_line(event: str, **fields) -> None:
             except Exception:
                 pass
             try:
+                # Lazy mkdir (do NOT move to module level — see STATE_DIR
+                # comment). If STATE_DIR is on a read-only mount, the mkdir
+                # or open will fail; we drop the line and keep the wrapper
+                # running instead of crashing on import.
+                STATE_DIR.mkdir(parents=True, exist_ok=True)
                 # buffering=1 (line buffering) so each '\n'-terminated line
                 # is flushed to the OS immediately, while still reusing
                 # the file handle across calls to avoid per-call open().
                 _log_fh = (STATE_DIR / f"mcp-{date_str}.log").open(
                     "a", encoding="utf-8", buffering=1,
                 )
-            except Exception:
+            except Exception as e:
+                sys.stderr.write(f"[codebuddy-mcp] log open failed: {e}\n")
                 _log_fh = None
             _log_date = date_str
         if _log_fh is not None:
@@ -455,6 +477,10 @@ class ACPSession:
 
     def list_tasks(self, limit: int = 10) -> list[dict]:
         if limit <= 0: return []
+        # Input schema says "max 50" — the deque's maxlen=50 also enforces
+        # this implicitly, but the explicit clamp here makes the doc claim
+        # match the code (NOTE #7).
+        if limit > 50: limit = 50
         items = list(self._tasks)[-limit:]
         items.reverse()
         return items
@@ -470,6 +496,43 @@ _session: Optional[ACPSession] = None
 _session_lock = threading.Lock()
 
 
+def _health_check_codebuddy(cb_bin: str) -> None:
+    """Verify the codebuddy binary is reachable BEFORE we start the
+    long-lived subprocess. Raises RuntimeError with a clear, actionable
+    message if the binary is missing, returns non-zero, or hangs.
+
+    Adds ~0.5-1s latency to first call after a fresh session start (where
+    the user already pays a model warmup cost). Pays for itself the first
+    time someone has a typo in $PATH — they get "set CODEBUDDY_BIN or
+    install codebuddy" instead of a confusing FileNotFoundError stack.
+    """
+    try:
+        r = subprocess.run(
+            [cb_bin, "--version"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode != 0:
+            err = (r.stderr or r.stdout or "").strip()[:200]
+            raise RuntimeError(
+                f"codebuddy at {cb_bin!r} returned exit {r.returncode}: {err!r}\n"
+                f"  → Set CODEBUDDY_BIN to the full path of a working codebuddy, or\n"
+                f"  → Install with `npm i -g @tencent-ai/codebuddy-code`."
+            )
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"codebuddy binary not found: {cb_bin!r}\n"
+            f"  → Set CODEBUDDY_BIN env var to the full path, or\n"
+            f"  → Install with `npm i -g @tencent-ai/codebuddy-code`, or\n"
+            f"  → Symlink codebuddy onto $PATH."
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"codebuddy at {cb_bin!r} did not respond to --version within 5s.\n"
+            f"  → Likely a broken install or a hung interactive prompt. "
+            f"Try `codebuddy --version` manually."
+        )
+
+
 def get_session() -> ACPSession:
     global _session
     with _session_lock:
@@ -477,6 +540,9 @@ def get_session() -> ACPSession:
             cwd = os.environ.get("CODEBUDDY_MCP_CWD") or os.getcwd()
             cb_bin = os.environ.get("CODEBUDDY_BIN") or "codebuddy"
             base = os.environ.get("MCODE_BASE_PROMPT_FILE")
+            # Fail-fast: verify reachability before spawning the long-lived
+            # subprocess. This is the only time we pay the 0.5-1s cost.
+            _health_check_codebuddy(cb_bin)
             _session = ACPSession(codebuddy_bin=cb_bin, cwd=cwd, mcode_base_prompt_file=base)
         return _session
 

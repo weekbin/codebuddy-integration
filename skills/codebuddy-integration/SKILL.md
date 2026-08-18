@@ -5,7 +5,7 @@ license: MIT
 compatibility: Requires MiniMax Code with Agent Plugins 1.0.0+ support, the `codebuddy` CLI on $PATH (or `CODEBUDDY_BIN` env var), Python 3.10+ with the `mcp` package.
 metadata:
   author: weekbin
-  version: "0.3.5"
+  version: "0.3.6"
 ---
 
 # codebuddy-integration

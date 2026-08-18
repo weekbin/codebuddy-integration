@@ -11,7 +11,7 @@ client) that exposes `codebuddy` as 5 MCP tools. mcode loads
 `mcp.json` on session start; the wrapper keeps one
 `codebuddy --acp` subprocess alive for the session.
 
-Version: 0.3.5. Status: stable, in production use.
+Version: 0.3.6. Status: stable, in production use.
 
 ## File layout (what matters)
 

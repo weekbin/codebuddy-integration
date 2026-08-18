@@ -5,7 +5,8 @@
       "type": "stdio",
       "command": "./bin/codebuddy-mcp-server.py",
       "env": {
-        "MCODE_BASE_PROMPT_FILE": "${PLUGIN_ROOT}/assets/mcode-base-system-prompt.md"
+        "MCODE_BASE_PROMPT_FILE": "${PLUGIN_ROOT}/assets/mcode-base-system-prompt.md",
+        "MCP_STATE_DIR": "${PLUGIN_DATA}/state"
       }
     }
   }
