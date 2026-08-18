@@ -1,11 +1,11 @@
 ---
 name: codebuddy-integration
-description: "Delegate a text-reasoning subtask to codebuddy (a peer LLM) via 8 MCP tools over a long-lived `codebuddy --acp` subprocess. DEFAULT pattern: dispatch a `task(run_in_background=true, agent_name='worker')` so the main agent's wall clock is not blocked; the worker calls `mcp__codebuddy__run(...)` (single call, millisecond-scale submit + short-poll loop). Use for translate / summarize / review / brainstorm / second opinion. Burns codebuddy credits, not mcode tokens. Triggers: '用 codebuddy', '让 codebuddy', 'ask codebuddy'."
+description: "Delegate a text-reasoning subtask to codebuddy (a peer LLM) via 9 MCP tools over a long-lived `codebuddy --acp` subprocess. DEFAULT pattern: dispatch a `task(run_in_background=true, agent_name='worker')` so the main agent's wall clock is not blocked; the worker calls `mcp__codebuddy__run(...)` (single call, millisecond-scale submit + short-poll loop). Use for translate / summarize / review / brainstorm / second opinion. Burns codebuddy credits, not mcode tokens. Triggers: '用 codebuddy', '让 codebuddy', 'ask codebuddy'."
 license: MIT
 compatibility: "Requires MiniMax Code with Agent Plugins 1.0.0+ support, the `codebuddy` CLI on $PATH (or `CODEBUDDY_BIN` env var), Python 3.10+ with the `mcp>=2.0.0,<3` package installed into the **same** `python3` the wrapper resolves at runtime (its shebang `#!/usr/bin/env python3`); otherwise startup fails with `ModuleNotFoundError: No module named 'mcp'` and the plugin loads zero tools."
 metadata:
   author: weekbin
-  version: "0.4.1"
+  version: "0.4.2"
 ---
 
 # codebuddy-integration

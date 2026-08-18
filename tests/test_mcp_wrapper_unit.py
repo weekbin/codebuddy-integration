@@ -756,14 +756,14 @@ class TestGlobalTimeoutDefaults(unittest.TestCase):
         self.assertNotIn("continue", names)
 
     def test_eight_tools_total(self):
-        # 0.4.1: added cancel_task → 8 tools.
-        self.assertEqual(len(_mod.ALL_TOOLS), 8)
+        # 0.4.2: added kill_codebuddy → 9 tools.
+        self.assertEqual(len(_mod.ALL_TOOLS), 9)
 
     def test_expected_tool_set(self):
         names = {t.name for t in _mod.ALL_TOOLS}
         self.assertEqual(names, {
             "submit_prompt", "submit_continue", "get_result", "run",
-            "cancel_task", "status", "list_tasks", "list_models",
+            "cancel_task", "kill_codebuddy", "status", "list_tasks", "list_models",
         })
 
 
@@ -786,14 +786,20 @@ class TestCancelTask(unittest.TestCase):
             submitted_at="2026-08-18T10:00:00+00:00", model="deepseek-v4-flash",
         )
         sess = self._build_sess(inflight=rec)
+        # Force=False (default): codebuddy subprocess NOT killed.
+        sess.proc = mock.MagicMock()
+        sess.proc.poll.return_value = None  # process is alive
         with mock.patch.object(_mod, "_save_task", return_value=True):
             out = sess.cancel_task("tsk_cancel1234ab")
         self.assertEqual(out["status"], "cancelled")
+        self.assertEqual(out["force_killed"], False)
         # Inflight is cleared
         self.assertIsNone(sess._inflight)
         # Record is marked cancelled
         self.assertEqual(rec.status, "cancelled")
         self.assertEqual(rec.error, "cancelled by user")
+        # Force=False means codebuddy was NOT killed
+        sess.proc.kill.assert_not_called()
 
     def test_cancel_done_task(self):
         rec = _mod.TaskRecord(
@@ -827,6 +833,134 @@ class TestCancelTask(unittest.TestCase):
             out = sess.cancel_task("tsk_disk1234ab")
         self.assertEqual(out["status"], "cancelled")
         self.assertEqual(disk_rec.status, "cancelled")
+
+    def test_cancel_inflight_force_kills_codebuddy(self):
+        # 0.4.2: force=True ALSO kills the codebuddy subprocess. The
+        # daemon thread gets a broken-pipe error and cleans up.
+        import unittest.mock as mock
+        rec = _mod.TaskRecord(
+            task_id="tsk_force1234ab", status="running",
+            submitted_at="2026-08-18T10:00:00+00:00", model="deepseek-v4-flash",
+        )
+        sess = self._build_sess(inflight=rec)
+        # codebuddy subprocess is alive (poll returns None)
+        sess.proc = mock.MagicMock()
+        sess.proc.poll.return_value = None
+        with mock.patch.object(_mod, "_save_task", return_value=True):
+            out = sess.cancel_task("tsk_force1234ab", force=True)
+        self.assertEqual(out["status"], "cancelled")
+        self.assertEqual(out["force_killed"], True)
+        # The codebuddy subprocess WAS killed
+        sess.proc.kill.assert_called_once()
+        # The cancelled record has the force-specific error message
+        self.assertIn("force", rec.error)
+        self.assertIn("killed", rec.error)
+
+    def test_cancel_inflight_force_skips_when_proc_already_dead(self):
+        # 0.4.2: if the codebuddy subprocess is already dead (poll
+        # returns non-None), force=True should still mark the task
+        # cancelled but report force_killed=False (nothing to kill).
+        import unittest.mock as mock
+        rec = _mod.TaskRecord(
+            task_id="tsk_alreadydead1", status="running",
+            submitted_at="2026-08-18T10:00:00+00:00",
+        )
+        sess = self._build_sess(inflight=rec)
+        sess.proc = mock.MagicMock()
+        sess.proc.poll.return_value = 1  # process already dead
+        with mock.patch.object(_mod, "_save_task", return_value=True):
+            out = sess.cancel_task("tsk_alreadydead1", force=True)
+        self.assertEqual(out["force_killed"], False)
+        sess.proc.kill.assert_not_called()
+
+    def test_cancel_done_task_force_noop(self):
+        # 0.4.2: force=True on a done task (not in-flight) just marks
+        # cancelled without trying to kill the subprocess. The force
+        # flag only matters when the task is currently in-flight.
+        import unittest.mock as mock
+        rec = _mod.TaskRecord(
+            task_id="tsk_done_force1", status="done",
+            submitted_at="2026-08-18T10:00:00+00:00",
+            result={"text": "x"},
+        )
+        sess = self._build_sess(done=[rec])
+        sess.proc = mock.MagicMock()
+        sess.proc.poll.return_value = None
+        with mock.patch.object(_mod, "_save_task", return_value=True):
+            out = sess.cancel_task("tsk_done_force1", force=True)
+        self.assertEqual(out["status"], "cancelled")
+        self.assertEqual(out["force_killed"], False)
+        # Codebuddy was NOT killed because the task wasn't in-flight
+        sess.proc.kill.assert_not_called()
+
+
+class TestKillCodebuddy(unittest.TestCase):
+    """0.4.2: kill_codebuddy is the unconditional escape hatch — no
+    task_id needed. Use it when the wrapper is stuck and you can't even
+    identify which task to cancel."""
+
+    def _build_sess(self, *, inflight=None):
+        import unittest.mock as mock
+        sess = _mod.ACPSession.__new__(_mod.ACPSession)
+        sess._inflight = inflight
+        sess._tasks_done = deque(maxlen=50)
+        sess._task_event = threading.Event()
+        sess._task_lock = threading.Lock()
+        sess.proc = mock.MagicMock()
+        sess.proc.poll.return_value = None  # process alive
+        return sess
+
+    def test_kill_codebuddy_no_inflight(self):
+        import unittest.mock as mock
+        sess = self._build_sess(inflight=None)
+        out = sess.kill_codebuddy()
+        self.assertEqual(out["status"], "killed")
+        self.assertTrue(out["codebuddy_was_running"])
+        self.assertFalse(out["had_inflight_task"])
+        self.assertTrue(out["respawn_on_next_call"])
+        sess.proc.kill.assert_called_once()
+
+    def test_kill_codebuddy_marks_inflight_cancelled(self):
+        # If there's an in-flight task, it must be marked cancelled
+        # BEFORE the kill so the daemon thread's finalize writes the
+        # right status to disk.
+        import unittest.mock as mock
+        rec = _mod.TaskRecord(
+            task_id="tsk_kill_inflight", status="running",
+            submitted_at="2026-08-18T10:00:00+00:00",
+        )
+        sess = self._build_sess(inflight=rec)
+        with mock.patch.object(_mod, "_save_task", return_value=True):
+            out = sess.kill_codebuddy()
+        self.assertEqual(out["status"], "killed")
+        self.assertTrue(out["had_inflight_task"])
+        # Inflight is cleared
+        self.assertIsNone(sess._inflight)
+        # The cancelled record has the kill-specific error
+        self.assertEqual(rec.status, "cancelled")
+        self.assertIn("killed", rec.error)
+        sess.proc.kill.assert_called_once()
+
+    def test_kill_codebuddy_proc_already_dead(self):
+        import unittest.mock as mock
+        sess = self._build_sess(inflight=None)
+        sess.proc.poll.return_value = 1  # already dead
+        out = sess.kill_codebuddy()
+        # force_killed is False (nothing to kill), but status is still
+        # "killed" (the call succeeded; the wrapper can move on)
+        self.assertEqual(out["status"], "killed")
+        self.assertFalse(out["codebuddy_was_running"])
+        sess.proc.kill.assert_not_called()
+
+    def test_kill_codebuddy_handles_proc_kill_exception(self):
+        # If proc.kill() raises (e.g., on Windows or broken proc state),
+        # we return a clean error rather than crashing the wrapper.
+        import unittest.mock as mock
+        sess = self._build_sess(inflight=None)
+        sess.proc.kill.side_effect = OSError("process already gone")
+        out = sess.kill_codebuddy()
+        self.assertEqual(out["status"], "error")
+        self.assertIn("process already gone", out["error"])
 
 
 class TestGetResultPollOnly(unittest.TestCase):

@@ -4,6 +4,45 @@ All notable changes to this plugin are documented in this file. The format is ba
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] - 2026-08-18
+
+### Added
+- **9th tool: `kill_codebuddy()`**. Absolute last-resort recovery — SIGKILL
+  the codebuddy subprocess unconditionally, no `task_id` needed. The next
+  call to `get_session()` detects `proc.poll() is not None` and respawns a
+  fresh codebuddy subprocess (existing recovery code path). Use this when
+  the wrapper is wedged and you can't even identify a specific in-flight
+  task to cancel. Loses the current `sessionId` and conversation history.
+- **`cancel_task(task_id, force=False)`** parameter: when `force=true` AND
+  the cancelled task was in-flight, ALSO SIGKILL the codebuddy subprocess.
+  The daemon thread, blocked in `self.call("session/prompt", ...)`,
+  receives a broken-pipe error; the `except` clause in
+  `_run_prompt_in_thread` catches it and writes the task to disk as
+  cancelled/errored. The next call respawns a fresh codebuddy subprocess.
+  Use this when the daemon thread is truly stuck on a hung model API and
+  a normal cancel can't recover (the daemon can't even finish the
+  cancellation write). Loses the current `sessionId` and conversation
+  history.
+- **5 new unit tests**: force-cancel kills proc, force-cancel skips dead
+  proc, force-cancel on done task is a no-op, kill_codebuddy no-inflight,
+  kill_codebuddy marks inflight, kill_codebuddy proc-already-dead,
+  kill_codebuddy handles proc.kill exception. Total: 71 tests.
+
+### Changed
+- `cancel_task` return schema now includes `force_killed: bool` (true if
+  force=True and the codebuddy subprocess was actually killed).
+
+### Kept
+- 5 MCP timeout env vars in `mcp.json` (all 1h).
+- Task persistence to `${PLUGIN_DATA}/tasks/<task_id>.json` with `TASK_LIFETIME_S=86400` (24h).
+- 9 tools total: submit_prompt, submit_continue, get_result, run,
+  cancel_task, kill_codebuddy, status, list_tasks, list_models.
+- 1h global timeout default.
+- All other 0.4.1 fixes (poll-only get_result, list_models cache
+  invalidation, status.model fallback, etc.).
+
+
+
 ## [0.4.1] - 2026-08-18
 
 ### Fixed

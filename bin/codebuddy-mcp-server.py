@@ -739,7 +739,7 @@ class ACPSession:
             # first set see "done" rather than blocking forever.
             self._task_event.set()
 
-    def cancel_task(self, task_id: str) -> dict:
+    def cancel_task(self, task_id: str, force: bool = False) -> dict:
         """Cancel an in-flight or recent task. Frees the wrapper to accept
         a new submit. The actual codebuddy subprocess call (if in-flight)
         continues running but its result is discarded when the daemon
@@ -747,6 +747,18 @@ class ACPSession:
         does not enter _tasks_done. This avoids the race where a freshly-
         spawned in-flight task gets overwritten by a late result from the
         cancelled one.
+
+        `force=True` (0.4.2+): when the cancelled task was in-flight, ALSO
+        kill the codebuddy subprocess (SIGKILL). Use this as the
+        last-resort recovery when the daemon thread is truly stuck (e.g.,
+        the model API itself is hung and a normal cancel can't recover
+        because the daemon thread is blocked waiting for codebuddy's
+        JSON-RPC response). The kill unblocks the daemon thread via a
+        broken-pipe error; the next call to get_session() detects
+        `proc.poll() is not None` and respawns a fresh codebuddy
+        subprocess (this is the existing _session-recovery code path).
+        Loses the in-flight task and codebuddy's sessionId; the
+        conversation history is gone.
 
         Idempotent: cancelling an already-cancelled/done task is a no-op
         (returns the existing record).
@@ -759,7 +771,8 @@ class ACPSession:
                 # Currently in-flight. Mark cancelled, clear _inflight.
                 inflight.status = "cancelled"
                 inflight.completed_at = datetime.now(timezone.utc).isoformat()
-                inflight.error = "cancelled by user"
+                inflight.error = ("cancelled by user (force: codebuddy killed)"
+                                   if force else "cancelled by user")
                 cancelled = inflight
                 was_inflight = True
                 self._inflight = None
@@ -783,16 +796,75 @@ class ACPSession:
             disk.completed_at = datetime.now(timezone.utc).isoformat()
             disk.error = "cancelled by user"
             _save_task(disk)
-            _log_line("task_cancelled", task_id=task_id, was_inflight=False)
+            _log_line("task_cancelled", task_id=task_id, was_inflight=False, force=force)
             return {"task_id": task_id, "status": "cancelled",
                     "completed_at": disk.completed_at}
+        # If force=True and we actually cleared the in-flight task, also
+        # kill the codebuddy subprocess. The daemon thread, currently
+        # blocked in self.call("session/prompt", ...), will get a
+        # broken-pipe error; the except clause in _run_prompt_in_thread
+        # catches it and writes the task to disk as cancelled/errored.
+        force_killed = False
+        if force and was_inflight:
+            try:
+                if self.proc and self.proc.poll() is None:
+                    self.proc.kill()
+                    force_killed = True
+            except Exception as e:
+                _log_line("codebuddy_force_kill_failed", task_id=task_id, err=str(e))
+            else:
+                if force_killed:
+                    _log_line("codebuddy_force_killed", task_id=task_id)
         # Persist + log
         _save_task(cancelled)
-        _log_line("task_cancelled", task_id=task_id, was_inflight=was_inflight)
+        _log_line("task_cancelled", task_id=task_id, was_inflight=was_inflight,
+                  force=force, force_killed=force_killed)
         # Wake any get_result pollster
         self._task_event.set()
         return {"task_id": task_id, "status": "cancelled",
-                "completed_at": cancelled.completed_at}
+                "completed_at": cancelled.completed_at,
+                "force_killed": force_killed}
+
+    def kill_codebuddy(self) -> dict:
+        """Force-kill the codebuddy subprocess unconditionally. Use this
+        as the absolute last-resort recovery when the wrapper is stuck
+        and even cancel_task(force=True) doesn't help (e.g., the
+        subprocess is in a bad state but no in-flight task to cancel).
+
+        The next call to get_session() detects `proc.poll() is not None`
+        and respawns a fresh codebuddy subprocess. The current
+        `sessionId` and conversation history are lost.
+
+        If there is an in-flight task, it's marked as cancelled (with
+        a "codebuddy killed" error message) so the daemon thread can
+        clean up when its call() gets the broken-pipe error.
+        """
+        killed = False
+        with self._task_lock:
+            inflight = self._inflight
+            if inflight is not None:
+                # Mark cancelled so the daemon thread's finalize path
+                # writes the right status to disk when it gets the
+                # broken-pipe error.
+                inflight.status = "cancelled"
+                inflight.completed_at = datetime.now(timezone.utc).isoformat()
+                inflight.error = "codebuddy subprocess killed (kill_codebuddy)"
+                self._inflight = None
+        try:
+            if self.proc and self.proc.poll() is None:
+                self.proc.kill()
+                killed = True
+        except Exception as e:
+            _log_line("codebuddy_kill_failed", err=str(e))
+            return {"status": "error", "error": f"kill failed: {e}"}
+        if killed:
+            _log_line("codebuddy_killed", reason="kill_codebuddy tool",
+                      had_inflight=(inflight is not None))
+            if inflight is not None:
+                _save_task(inflight)
+        return {"status": "killed", "codebuddy_was_running": killed,
+                "had_inflight_task": inflight is not None,
+                "respawn_on_next_call": True}
 
     def get_result(self, task_id: str, wait_timeout_s: int = 0,
                    mode: str = "poll") -> dict:
@@ -1149,18 +1221,26 @@ TOOL_LIST_MODELS = Tool(
 )
 TOOL_CANCEL_TASK = Tool(
     name="cancel_task",
-    description=("Cancel an in-flight or recent task. Use this when a codebuddy call is hung (model API issue, codebuddy CLI bug, network) and the wrapper is stuck on a single in-flight task. Marks the task as cancelled and frees the wrapper to accept a new submit. The actual codebuddy subprocess call continues running but its result is discarded when the daemon thread finishes — it gets persisted with status='cancelled' and does not enter list_tasks / get_result's in-memory results. Idempotent: cancelling an already-cancelled/done task returns the existing record."),
+    description=("Cancel an in-flight or recent task. Use this when a codebuddy call is hung (model API issue, codebuddy CLI bug, network) and the wrapper is stuck on a single in-flight task. Marks the task as cancelled and frees the wrapper to accept a new submit. The actual codebuddy subprocess call continues running but its result is discarded when the daemon thread finishes — it gets persisted with status='cancelled' and does not enter list_tasks / get_result's in-memory results. Idempotent: cancelling an already-cancelled/done task returns the existing record. **Set `force=true` to ALSO kill the codebuddy subprocess** (SIGKILL): use this when the daemon thread is truly stuck on a hung model API. The next call respawns a fresh codebuddy subprocess (loses the current sessionId and conversation history)."),
     inputSchema={
         "type": "object",
         "properties": {
             "task_id": {"type": "string", "description": "The task_id returned by submit_prompt / submit_continue, or observed in status / list_tasks as the in-flight task."},
+            "force": {"type": "boolean", "default": False,
+                      "description": "If true, also SIGKILL the codebuddy subprocess in addition to marking the task as cancelled. Use this as the last-resort recovery when the daemon thread is stuck. The next call respawns a fresh codebuddy subprocess. Loses the current sessionId and conversation history."},
         },
         "required": ["task_id"],
     },
 )
+TOOL_KILL_CODEBUDDY = Tool(
+    name="kill_codebuddy",
+    description=("Force-kill the codebuddy subprocess unconditionally. Absolute last-resort recovery when the wrapper is stuck and even cancel_task(force=true) doesn't help (e.g., subprocess is in a bad state but there's no specific in-flight task to cancel, or the daemon thread is stuck on a non-cancel-related wait). The next call to get_session() detects the dead proc and respawns a fresh codebuddy subprocess. Loses the current sessionId and conversation history. If there is an in-flight task, it's marked as cancelled with a 'codebuddy killed' error message."),
+    inputSchema={"type": "object", "properties": {}, "additionalProperties": False},
+)
 
 ALL_TOOLS = [TOOL_SUBMIT_PROMPT, TOOL_SUBMIT_CONTINUE, TOOL_GET_RESULT, TOOL_RUN,
-             TOOL_CANCEL_TASK, TOOL_STATUS, TOOL_LIST_TASKS, TOOL_LIST_MODELS]
+             TOOL_CANCEL_TASK, TOOL_KILL_CODEBUDDY, TOOL_STATUS, TOOL_LIST_TASKS,
+             TOOL_LIST_MODELS]
 
 
 async def _list_tools(ctx, params):
@@ -1284,7 +1364,13 @@ async def _call_tool(ctx, params):
         if not task_id:
             raise ValueError("cancel_task: missing required arg: task_id")
         sess = get_session()
-        result = sess.cancel_task(task_id)
+        force = bool(arguments.get("force", False))
+        result = sess.cancel_task(task_id, force=force)
+        return CallToolResult(content=[TextContent(type="text",
+            text=json.dumps(result, ensure_ascii=False))])
+    if name == "kill_codebuddy":
+        sess = get_session()
+        result = sess.kill_codebuddy()
         return CallToolResult(content=[TextContent(type="text",
             text=json.dumps(result, ensure_ascii=False))])
     raise ValueError(f"unknown tool: {name}")

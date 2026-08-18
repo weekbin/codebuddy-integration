@@ -3,12 +3,12 @@
 > 给 mcode 增加一个调用 codebuddy 的入口，处理翻译、长文摘要、寻求不同意见、
 > 换思路重写代码这类纯文字任务。通过 stdio MCP 维持一个长生命周期的
 > `codebuddy --acp` 子进程，首次调用预热后缓存命中率稳定 99% 左右。
-> 版本 0.4.1。
+> 版本 0.4.2。
 
 ## MCP 工具
 
 mcode 启动时通过 `<plugin>/mcp.json` 自动 spawn `bin/codebuddy-mcp-server.py`，
-wrapper 维持一个长生命周期的 `codebuddy --acp` 子进程，暴露 8 个 tool
+wrapper 维持一个长生命周期的 `codebuddy --acp` 子进程，暴露 9 个 tool
 （`run` 是便利 wrapper，把 `submit_prompt` + 短轮询 get_result 合在一起）：
 
 | Tool | 用途 | 关键参数 |
@@ -17,7 +17,8 @@ wrapper 维持一个长生命周期的 `codebuddy --acp` 子进程，暴露 8 �
 | `submit_continue(text, ...)` | 同一 codebuddy 会话追问（复用 `sessionId`），立即返回 task_id | 同 `submit_prompt` 参数 |
 | `get_result(task_id)` | 取已提交 task 的当前状态。**仅 poll 模式**（毫秒级返回，调用方自行循环 poll）。`mode="blocking"` 会抛 ValueError | `wait_timeout_s?` ignored（保留向后兼容，默认 0） |
 | `run(text, ...)` | 便利：submit + 内部短轮询循环（≤30s），单调用拿结果。worker 模板首选 | `model?` 同上；`wait_timeout_s?` 默认 3600（MCP 请求本身 ≤30s） |
-| `cancel_task(task_id)` | 取消 in-flight 或最近 task。codebuddy 卡住时用它解锁 wrapper | `task_id` 必填 |
+| `cancel_task(task_id, force?)` | 取消 in-flight 或最近 task。codebuddy 卡住时用它解锁 wrapper。`force=true` 还会 SIGKILL codebuddy 子进程（最保底） | `task_id` 必填；`force?` 默认 false |
+| `kill_codebuddy()` | **保底**：无条件 SIGKILL codebuddy 子进程（不需 task_id）。最暴力的恢复手段，下次 call 自动 respawn | 无 |
 | `status()` | wrapper + codebuddy 状态（pid、acp_session_id、model、uptime、call_count、最后 cache_ratio、累计 token、`inflight_task_id`、`inflight_model`） | 无 |
 | `list_tasks(limit?)` | 最近 N 次调用的元数据（最新优先）+ 当前 in-flight task | `limit` 默认 10，clamp 到 50 |
 | `list_models()` | 列出可用 model id + credits / maxInputTokens / supportsReasoning | 无 |
@@ -83,7 +84,7 @@ stdio MCP server，mcode 启动时读取并 spawn wrapper。
 
 - **异步 submit/poll 架构**：每条 MCP 请求毫秒级。`submit_prompt` 立即返回 task_id；
   codebuddy 实际调用在 wrapper 后台线程跑；`get_result` 取结果。`run` 把两者合一。
-  **MCP 客户端的 per-request 时延上限无法丢失 0.4.0 之后的长 call 响应**。
+  **MCP 客户端的 per-request 时延上限无法丢失长 call 响应**。
 - **长生命周期的 `codebuddy --acp` 子进程**：系统 prompt + tool catalog 一次性加载
   到内存，后续 `prompt_tokens` prefix 复用率稳定 99%。每个调用方（worker / 主 agent）
   拿到自己的 `acp_session_id`，互不污染。

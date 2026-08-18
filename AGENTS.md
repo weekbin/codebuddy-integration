@@ -7,11 +7,11 @@ in this repo. **Not** for end users — see `README.md` for that.
 
 `codebuddy-integration` is a **plugin** for mcode (and any other
 [Agent Plugins 1.0.0](https://agent-plugins.org/specification)
-client) that exposes `codebuddy` as 8 MCP tools. mcode loads
+client) that exposes `codebuddy` as 9 MCP tools. mcode loads
 `mcp.json` on session start; the wrapper keeps one
 `codebuddy --acp` subprocess alive for the session.
 
-Version: 0.4.1. Status: stable, in production use.
+Version: 0.4.2. Status: stable, in production use.
 
 ## File layout (what matters)
 
@@ -25,7 +25,7 @@ Version: 0.4.1. Status: stable, in production use.
 | `tests/mcp-poc-test.py` | 5-call cold→warm cache smoke | After changing cache behavior |
 | `tests/mcp-features-test.py` | 7-tool end-to-end (status, list_tasks, list_models, run, submit, get_result, model switch, append respawn, thinking) | After adding/changing tools |
 | `tests/mcp-long-prompt-test.py` | Long-reply regression for reply concatenation (auto-skips on 429) | After changing reply concatenation |
-| `tests/test_mcp_wrapper_unit.py` | 64 unit tests (no subprocess) | After changing wrapper internals |
+| `tests/test_mcp_wrapper_unit.py` | 71 unit tests (no subprocess) | After changing wrapper internals |
 | `CHANGELOG.md` | Keep-a-Changelog format | Every release |
 
 `state/` and `logs/` are gitignored runtime output. `__pycache__/`
@@ -83,7 +83,7 @@ Key non-obvious rules:
 - **Wrapper code**: Python 3.10+ compatible, no type-annotation
   syntax that requires 3.12+. Use `pathlib.Path`, not `os.path`.
   Thread-safe where it matters (the `ACPSession` reads from a
-  background reader thread, and the 0.4.0 async API uses a
+  background reader thread, and the async submit/poll API uses a
   `_task_lock` for task state).
 - **MCP server log line format**: `<iso-ts> | <event-name> | k=v | k=v ...`
   (pipe-separated, one line per event). Daily rotation by filename.
