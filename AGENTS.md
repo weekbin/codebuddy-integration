@@ -11,7 +11,7 @@ client) that exposes `codebuddy` as 5 MCP tools. mcode loads
 `mcp.json` on session start; the wrapper keeps one
 `codebuddy --acp` subprocess alive for the session.
 
-Version: 0.3.9. Status: stable, in production use.
+Version: 0.3.10. Status: stable, in production use.
 
 ## File layout (what matters)
 
@@ -24,7 +24,7 @@ Version: 0.3.9. Status: stable, in production use.
 | `assets/mcode-base-system-prompt.md` | Base system prompt injected into every codebuddy call | Changing mcode's identity/role/boundary for codebuddy |
 | `tests/mcp-poc-test.py` | 5-call cold→warm cache smoke | After changing cache behavior |
 | `tests/mcp-features-test.py` | 5-tool end-to-end (status, list_tasks, list_models, prompt, continue, model, append respawn, thinking) | After adding/changing tools |
-| `tests/mcp-long-prompt-test.py` | Long-reply regression (0.3.1 truncation bug) | After changing reply concatenation |
+| `tests/mcp-long-prompt-test.py` | Long-reply regression for reply concatenation (auto-skips on 429) | After changing reply concatenation |
 | `tests/test_mcp_wrapper_unit.py` | 34 unit tests (no subprocess) | After changing wrapper internals |
 | `CHANGELOG.md` | Keep-a-Changelog format | Every release |
 

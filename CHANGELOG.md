@@ -4,6 +4,21 @@ All notable changes to this plugin are documented in this file. The format is ba
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.10] - 2026-08-18
+
+### Changed
+- **Dropped history-only paragraphs from README, SKILL.md, AGENTS.md so the docs match the current implementation and don't carry dated evidence paragraphs that the model has to skip**. Specifically:
+  - `README.md` L84-95: removed the `### 2026-08-18 实测` section + table (specific call 1/2/3 cache-ratio numbers, sync-vs-async mode column) — the actionable guidance ("always dispatch via worker, fallback to sync only when needed") is already in the `Default pattern` rule above and the `关键约束` section. The measurement table is history.
+  - `SKILL.md` `Default pattern` rule: dropped the trailing `The 2026-08-18 verification on deepseek-v4-flash: three calls in one session ... 2.2% → 52.8% → 99.6% ...` paragraph (same reasoning — cache warming behavior is described upfront; the dated verification is history).
+  - `SKILL.md` `Don't pass a short timeout=` rule: dropped the parenthetical `(confirmed: a 113K-token review prompt finished in 157.49s, but a 180s worker-side timeout dropped the response with the credits already spent)` — rule stands on its own; the empirical evidence is in CHANGELOG 0.3.9.
+  - `AGENTS.md` file layout table: `Long-reply regression (0.3.1 truncation bug)` → `Long-reply regression for reply concatenation (auto-skips on 429)` — drops the version-pinned bug reference; current behavior is the same test, the historical name was a leftover.
+
+### Kept
+- `CHANGELOG.md` retains all the dated evidence (it's a history log; not a model-facing doc). The 0.3.9 entry still cites the 113K-token / 157.49s / 180s measurement, the 0.3.8 entry still mentions the 2.2% → 52.8% → 99.6% cache-warm progression. That's the right place for them.
+
+### Out of scope (noted, not fixed)
+- `assets/mcode-base-system-prompt.md` mixes `Mavis` / `Mavis` / `mavis` (current Mavis 2.x is consistently `Mavis`) and references `invoke-codebuddy` (deleted in 0.3.0). This is a system-prompt file consumed by the codebuddy subagent, not a user/AI-facing doc; the rename is a behavior change, not a doc-drift fix, and was intentionally left out of this release.
+
 ## [0.3.9] - 2026-08-18
 
 ### Fixed

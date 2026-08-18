@@ -3,7 +3,7 @@
 > 给 mcode 增加一个调用 codebuddy 的入口，处理翻译、长文摘要、寻求不同意见、
 > 换思路重写代码这类纯文字任务。通过 stdio MCP 维持一个长生命周期的
 > `codebuddy --acp` 子进程，首次调用预热后缓存命中率稳定 99% 左右。
-> 版本 0.3.8。
+> 版本 0.3.10。
 
 ## MCP 工具
 
@@ -16,7 +16,7 @@ wrapper 维持一个长生命周期的 `codebuddy --acp` 子进程，暴露 5 �
 | `continue(text, ...)` | 同一 codebuddy 会话追问，复用 `sessionId`，不重启子进程 | 同 `prompt` 参数 |
 | `status()` | wrapper + codebuddy 状态（pid、acp_session_id、model、uptime、call_count、最后 cache_ratio、累计 token） | 无 |
 | `list_tasks(limit?)` | 最近 N 次调用的元数据（最新优先），每条含 model/dur/prompt_tokens/completion_tokens/cached_tokens/cache_ratio/stop_reason | `limit` 默认 10，clamp 到 50 |
-| `list_models()` | 列出可用 model id + credits / maxInputTokens / supportsReasoning，从 `codebuddy --help` 解析 | 无 |
+| `list_models()` | 列出可用 model id + credits / maxInputTokens / supportsReasoning | 无 |
 
 `prompt` / `continue` 返回格式：
 
@@ -80,19 +80,6 @@ worker 上下文是**故意保持干净**的：codebuddy 完整 turn 历史留�
 - 每个 worker 进 wrapper 拿到自己的 `acp_session_id`，prefix cache 互不影响
 - N worker 并发的 wall clock ≈ Σ 单任务时长，**不是** max
 - 想真并发得等 0.4.0 的 streamable-HTTP transport（一个 worker 一个 server）
-
-### 2026-08-18 实测（`deepseek-v4-flash`）
-
-三次调用在同一个 mcode session 内完成，parent 端**无阻塞**做了独立工作，
-wrapper 内部命中同一个 `codebuddy --acp` 子进程，prefix cache 单调升温：
-
-| call | 模式 | dur | cache_ratio | completion_tokens |
-|------|------|-----|-------------|-------------------|
-| 1 | sync（先前的） | 3.75s | 2.2% | 55 |
-| 2 | **async** (worker + `run_in_background=true`) | 2.26s | 52.8% | 38 |
-| 3 | sync | 1.84s | 99.6% | 4 |
-
-prefix cache 越用越热 → 第三次调用几乎全 cache 命中。
 
 ## 快速试用
 
