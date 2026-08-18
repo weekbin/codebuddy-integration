@@ -1,18 +1,24 @@
 ---
 name: codebuddy-integration
-description: "Delegate a text-reasoning subtask to codebuddy (a peer LLM) via 5 MCP tools. Use for translate / summarize / review / brainstorm / second opinion. Burns codebuddy credits, not mcode tokens. Triggers: '用 codebuddy', '让 codebuddy', 'ask codebuddy'."
+description: "Delegate a text-reasoning subtask to codebuddy (a peer LLM). DEFAULT pattern: dispatch a `task(run_in_background=true, agent_name='worker')` so the main agent's wall clock is not blocked — sync `mcp__codebuddy__prompt` is a fallback only when the parent has nothing else to do. Use for translate / summarize / review / brainstorm / second opinion. Burns codebuddy credits, not mcode tokens. Triggers: '用 codebuddy', '让 codebuddy', 'ask codebuddy', 'second opinion'."
 license: MIT
 compatibility: "Requires MiniMax Code with Agent Plugins 1.0.0+ support, the `codebuddy` CLI on $PATH (or `CODEBUDDY_BIN` env var), Python 3.10+ with the `mcp>=2.0.0,<3` package. Install the `mcp` package into the **same** `python3` the wrapper resolves at runtime (its shebang `#!/usr/bin/env python3`) — otherwise startup fails with `ModuleNotFoundError: No module named 'mcp'` and the plugin loads zero tools."
 metadata:
   author: weekbin
-  version: "0.3.12"
+  version: "0.3.13"
 ---
 
 # codebuddy-integration
 
 5 MCP tools over a long-lived `codebuddy --acp` subprocess, auto-loaded by mcode at session start via `<plugin>/mcp.json`.
 
-## Tools
+## Pattern (default — read this first)
+
+For **every** codebuddy call, dispatch a `task(run_in_background=true, agent_name="worker", ...)` so the main agent's wall clock is not blocked. The worker has its own mcode session and is the one that calls `mcp__codebuddy__prompt` / `mcp__codebuddy__continue`. The parent then continues with independent work and retrieves the result with `task_output(task_id)`.
+
+**Sync `mcp__codebuddy__prompt` is a fallback only** — when the parent has nothing else to do and the answer must be inline before the next step. Codebuddy calls serialize at the model layer across workers, so dispatching many workers gives you parallel orchestration (independent task IDs, independent `acp_session_id`s) but **not** parallel model inference — total wall clock is roughly the sum of per-call durations.
+
+## Tools (called from inside a worker unless sync is justified)
 
 | Tool | When |
 |---|---|
@@ -40,7 +46,6 @@ With `include_thinking=true`, also a `--- thinking (N chars) ---` section before
 
 - **Cold / warm**: first call in a new session is cold (~1.4% cache, ~4s); calls 2+ warm to ~99% cache, ~1-2s. Same `codebuddy_pid` across calls in one session.
 - **Multi-turn**: use `continue`, not `prompt` (keeps the warm cache, reuses `sessionId`).
-- **Default pattern — worker → mcp (asynchronous from main agent)**: dispatch a `task(run_in_background=true, agent_name="worker", prompt="...call mcp__codebuddy__prompt...")` subagent for **every** codebuddy call, not just long ones. The worker is its own mcode session; mcode's MCP server pool may share the same `codebuddy-mcp-server.py` wrapper across workers, and codebuddy calls **serialize at the model layer** (one reader thread + one `codebuddy --acp` subprocess). Each worker gets its own `acp_session_id`. **The main agent's wall clock is not blocked** — keep doing independent work in the parent session and retrieve the result with `task_output(task_id)` when ready. Sync `mcp__codebuddy__prompt(...)` is a deliberate fallback only when the parent has nothing else to do and the answer is needed inline before the next step.
 - **`model=` switch is dynamic**: changing `model=` mid-session uses `session/set_config_option` (preserves `sessionId`, cache, and turn history). No subprocess restart. Call `list_models()` first to confirm the id is supported.
 - **`append_system_prompt` change** respawns the subprocess and drops cache to cold. Set it once per session, not per call.
 - **`include_thinking=true`** exposes the model's reasoning trace. Off by default — a long task can produce hundreds of thought chunks. Set per-call, not per-session.

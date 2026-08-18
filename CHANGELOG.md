@@ -4,6 +4,26 @@ All notable changes to this plugin are documented in this file. The format is ba
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.13] - 2026-08-18
+
+### Fixed
+- **inputSchema `timeout` description lagged behind the real default** (`bin/codebuddy-mcp-server.py:645`): description said "(default 300)" but `ACPSession.__init__` had been bumped to 3600 in 0.3.9. Agents reading the schema would pass `timeout=300` (5 min) for long tasks, triggering `MCP error -32001: Request timed out` while codebuddy was still finishing — and credits were already spent. Description now reads "default 3600" + adds the "leave unset for any task that could plausibly take more than a minute" hint. Root cause: 0.3.9 changed the default value but missed the schema description copy.
+- **ACP `clientInfo.version` hardcoded to "0.3.3"** (`bin/codebuddy-mcp-server.py:256`): the version codebuddy sees when this wrapper initializes was 9 patches stale, misleading any future server-side diagnostics by version. Now follows the plugin version.
+- **`list_models` tool description referenced "what 0.3.3+ ships"** (`bin/codebuddy-mcp-server.py:671`): the parenthetical anchored a model-list feature to a 9-patch-old version. Dropped the version pin — the feature is current behavior, not a historical milestone.
+
+### Changed
+- **SKILL.md frontmatter `description` now leads with the default pattern** (`skills/codebuddy-integration/SKILL.md:3`): the description field is what mcode reads first when deciding whether to load the skill, and it now explicitly says "DEFAULT pattern: dispatch a `task(run_in_background=true, agent_name='worker')` ... sync is a fallback only when the parent has nothing else to do". An agent loading this skill now sees the async path as the default behavior, not a buried rule #3.
+- **SKILL.md gains a `## Pattern (default — read this first)` section before `## Tools`** (`skills/codebuddy-integration/SKILL.md`): visual hierarchy is flipped — the agent sees the orchestration pattern before the tool list, so it loads the skill thinking "dispatch a worker, then call mcp tools inside it" rather than "here are 5 tools, call them directly". The previous `Default pattern — worker → mcp` rule (rule #3) is consolidated into this section, and the tools table header now reads "Tools (called from inside a worker unless sync is justified)" so the worker-pattern reminder is unavoidable.
+- **`plugin.json` description drops "Phase 0+" road-map wording** (`plugin.json:5`): the trailing "Phase 0+ 通过 stdio MCP 提供长驻 wrapper..." parenthetical was a 0.x-era road-map note that adds no current-behavior info. The current shape (5 stdio MCP tools, mcode auto-spawn) is described in the rest of the field.
+- **`assets/mcode-base-system-prompt.md` unifies agent name to `Mavis`** (lines 1, 4, 5, 6, 7, 43): the file mixed `Mavis` / `Mavis` / `mavis` and contained the typo `Mavis/Mavis Code`. Per line 11 ("You are Mavis"), the product name is `Mavis` (Mavis Code as the full product). The 0.3.10 release noted this as out-of-scope (a behavior change vs. a doc-drift fix); 0.3.13 picks it up because the current shipped Mavis 2.x is consistently `Mavis` and the mixed forms were a leftover from a rename that happened in the Mavis 2.x line.
+- **`assets/mcode-base-system-prompt.md` final section header replaces `invoke-codebuddy 拼接` with the actual injection path** (line 207): `invoke-codebuddy*` was deleted in 0.3.0 (the global-install path was replaced by mcp.json's stdio spawn). The header now reads "由 codebuddy-mcp-server.py 在每次 prompt 时通过 --append-system-prompt-file 注入", matching the runtime behavior and removing a dead-code reference.
+
+### Added
+- **`plugin.json` gains `homepage` and `repository` fields** (`plugin.json:10-13`): both are spec-optional, but adding them lets human reviewers / future tooling locate the source from the manifest alone (vs. having to grep for the GitHub URL in `author.url`). Schema still 10-field-closed, both new fields are within the allowed top-level set.
+
+### Kept
+- 0.3.10's "Out of scope" note about the `assets/mcode-base-system-prompt.md` rename + dead-reference is now resolved; that release's CHANGELOG entry stays as-is (keep-a-changelog is the history log, not edited retroactively).
+
 ## [0.3.12] - 2026-08-18
 
 ### Fixed

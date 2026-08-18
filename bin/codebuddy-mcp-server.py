@@ -253,7 +253,7 @@ class ACPSession:
     def _initialize(self):
         self.call("initialize", {
             "protocolVersion": 1,
-            "clientInfo": {"name": "codebuddy-mcp-server", "version": "0.3.3"},
+            "clientInfo": {"name": "codebuddy-mcp-server", "version": "0.3.13"},
             "capabilities": {},
         }, timeout=15)
 
@@ -642,7 +642,7 @@ def _prompt_props() -> dict:
                                  "description": "Optional business rules / context appended to the mcode base system prompt. First call applies; subsequent changes trigger a subprocess respawn so the new append takes effect."},
         "include_thinking": {"type": "boolean",
                              "description": "If true, include the model's reasoning trace (`agent_thought_chunk` stream) in the response. Off by default — a long task can produce hundreds of thought chunks. Default false."},
-        "timeout": {"type": "integer", "description": "Per-call timeout in seconds (default 300)."},
+        "timeout": {"type": "integer", "description": "Per-call timeout in seconds (default 3600). Leave unset for any task that could plausibly take more than a minute."},
     }
 
 
@@ -668,7 +668,7 @@ TOOL_LIST_TASKS = Tool(
 )
 TOOL_LIST_MODELS = Tool(
     name="list_models",
-    description=("List codebuddy's supported model IDs. Reads from the live ACP session's `models.availableModels` (rich: per-model credits / maxInputTokens / supportsReasoning — what 0.3.3+ ships); falls back to parsing `codebuddy --help` only if no session is live yet. Use this before passing a `model=` argument to `prompt` / `continue` to verify the model id is valid (e.g. `deepseek-v4-flash`, `hy3`). Returns `{ok, models: [id, ...], count, source}` plus a `rich` array with per-model metadata on success; `{ok: false, error, ...}` on failure. Cached per process."),
+    description=("List codebuddy's supported model IDs. Reads from the live ACP session's `models.availableModels` (rich: per-model credits / maxInputTokens / supportsReasoning); falls back to parsing `codebuddy --help` only if no session is live yet. Use this before passing a `model=` argument to `prompt` / `continue` to verify the model id is valid (e.g. `deepseek-v4-flash`, `hy3`). Returns `{ok, models: [id, ...], count, source}` plus a `rich` array with per-model metadata on success; `{ok: false, error, ...}` on failure. Cached per process."),
     inputSchema={"type": "object", "properties": {}, "additionalProperties": False},
 )
 
