@@ -4,6 +4,11 @@ All notable changes to this plugin are documented in this file. The format is ba
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.12] - 2026-08-18
+
+### Fixed
+- **SKILL.md frontmatter failed to parse as YAML** — the `compatibility` value was an unquoted plain scalar containing the substring `` `ModuleNotFoundError: No module named 'mcp'` ``, and the `: ` (colon-space) inside that backtick-wrapped text broke YAML 1.2's plain-scalar rule, producing `bad indentation of a mapping entry (4:355)` from any strict parser. Symptom: mcode's "import plugin from GitHub" preview detected the skill as **0 skills + 1 invalid/unsupported component** (the SKILL.md directory was the "1 invalid" item being skipped). The mcp.json and plugin.json still parsed, which is why the preview showed `1 MCP Server` correctly. Fix: wrap the `compatibility` value in double quotes. Field semantics unchanged. `plugin.json` / `SKILL.md` / `AGENTS.md` / `README.md` version bumped to 0.3.12 in lockstep. 34/34 unit tests pass.
+
 ## [0.3.11] - 2026-08-18
 
 ### Changed
