@@ -2,10 +2,10 @@
 name: codebuddy-integration
 description: "Delegate a text-reasoning subtask to codebuddy (a peer LLM) via 5 MCP tools. Use for translate / summarize / review / brainstorm / second opinion. Burns codebuddy credits, not mcode tokens. Triggers: '用 codebuddy', '让 codebuddy', 'ask codebuddy'."
 license: MIT
-compatibility: Requires MiniMax Code with Agent Plugins 1.0.0+ support, the `codebuddy` CLI on $PATH (or `CODEBUDDY_BIN` env var), Python 3.10+ with the `mcp` package.
+compatibility: Requires MiniMax Code with Agent Plugins 1.0.0+ support, the `codebuddy` CLI on $PATH (or `CODEBUDDY_BIN` env var), Python 3.10+ with the `mcp>=2.0.0,<3` package (v1.x is EOL and the wrapper targets v2's `Server(name, on_list_tools=fn, on_call_tool=fn)` constructor-callback API).
 metadata:
   author: weekbin
-  version: "0.3.6"
+  version: "0.3.7"
 ---
 
 # codebuddy-integration

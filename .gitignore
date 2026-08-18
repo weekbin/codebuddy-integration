@@ -16,3 +16,6 @@ Thumbs.db
 *~
 .idea/
 .vscode/
+
+# Tool state (codebuddy CLI's own runtime dir, not this plugin's)
+.codebuddy/

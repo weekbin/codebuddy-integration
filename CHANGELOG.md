@@ -4,6 +4,14 @@ All notable changes to this plugin are documented in this file. The format is ba
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.7] - 2026-08-18
+
+### Fixed
+- **Wrapper was crashing on startup with `TypeError: Server.__init__() got an unexpected keyword argument 'on_list_tools'`** against `mcp==1.27.1` — the wrapper was written for the v2.x `Server(name, on_list_tools=fn, on_call_tool=fn)` constructor-callback API, but the host environment had v1.27.1 (decorator-based `@app.list_tools()` / `@app.call_tool()`) installed. The plugin's `~/.minimax/mcp.json` was registered, the skill was discoverable, codebuddy CLI was fine, but every `mcp__codebuddy__*` call would die because the wrapper subprocess couldn't even initialize. Root cause: the `on_list_tools=` / `on_call_tool=` constructor params never existed in v1.x and were introduced in the v2 lowlevel `Server` rewrite. Resolution: pin the host to `mcp>=2.0.0,<3` (`pip install --upgrade 'mcp>=2.0.0,<3'`). v1.x is EOL (moved to `v1.x` maintenance branch, only critical/security patches). No wrapper code change needed — v1 ↔ v2 are not API-compatible enough for a single source to target both, and the wrapper is already correctly v2-shaped. Verified post-upgrade: module imports, stdio `initialize` handshake (`2025-11-25`), `tools/list` returns the full 5-tool catalog with inputSchema, and `list_models` (zero-credit smoke) actually spawns `codebuddy --acp` and returns 11 valid model IDs. 34/34 unit tests pass in 0.219s.
+
+### Changed
+- **SKILL.md frontmatter version pinned to the runtime requirement** in the prose: "Python 3.10+ with the `mcp` package" → "Python 3.10+ with the `mcp>=2.0.0,<3` package". The plugin was previously silent about the version floor, which is what let the broken 1.27.1 install ship in the first place. No requirements.txt is shipped because the wrapper is a single-file script invoked directly via shebang; the mcp version is a host-environment concern documented at the install point.
+
 ## [0.3.6] - 2026-08-18
 
 ### Fixed
