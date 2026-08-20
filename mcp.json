@@ -4,6 +4,7 @@
     "codebuddy": {
       "type": "stdio",
       "command": "./bin/codebuddy-mcp-server.py",
+      "cwd": "${PLUGIN_ROOT}",
       "env": {
         "MCP_SERVER_REQUEST_TIMEOUT": "3600000",
         "MCP_REQUEST_TIMEOUT": "3600",

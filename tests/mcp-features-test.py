@@ -56,7 +56,8 @@ async def main() -> int:
             tools = await session.list_tools()
             names = sorted(t.name for t in tools.tools)
             expected = sorted(["submit_prompt", "submit_continue", "get_result",
-                               "run", "status", "list_tasks", "list_models"])
+                               "run", "cancel_task", "kill_codebuddy",
+                               "status", "list_tasks", "list_models"])
             assert names == expected, f"unexpected tools: {names} (expected {expected})"
             print(f"✓ tools/list: {names}")
             r = await session.call_tool("status", {})

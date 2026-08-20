@@ -245,9 +245,15 @@ def _collect_response_artifacts(r: dict, notifications: list,
         elif kind == "session_info_update":
             m = upd.get("_meta", {}).get("codebuddy.ai/requestModelId")
             if m: used_model = m
-        elif kind in ("agent_thought_chunk", "agent_message_chunk"):
-            m = upd.get("_meta", {}).get("codebuddy.ai/responseModelId")
-            if m: used_model = m
+        # NOTE: 0.4.4 removed the previously-dead branch
+        #   `elif kind in ("agent_thought_chunk", "agent_message_chunk")`
+        # which tried to extract `codebuddy.ai/responseModelId` from
+        # streaming chunks. The if/elif above already handles those kinds
+        # for message/thinking accumulation, so the later branch was
+        # unreachable. If a future codebuddy build starts sending the
+        # response model id only on chunks (not on session_info_update),
+        # re-introduce the extraction here — outside the elif chain so it
+        # doesn't get masked by the early branches.
     if not usage and isinstance(r, dict):
         meta = r.get("_meta", {})
         usage = meta.get("usage") or meta.get("codebuddy.ai/usage") or r.get("usage") or {}
@@ -324,6 +330,47 @@ def _fmt(v) -> str:
     if any(c in s for c in " |\n"):
         s = '"' + s.replace('"', '\\"') + '"'
     return s
+
+
+# ── ACP error model ───────────────────────────────────────────────
+# The codebuddy CLI surfaces 429 (rate limit) and other application
+# errors via the standard JSON-RPC `error` field. We carry the original
+# error dict into Python-land so the recovery path in
+# `_run_prompt_in_thread` can distinguish 429 from generic errors and
+# decide whether retrying is safe (it isn't for 429 — the prompt may
+# have been billed already).
+class ACPError(RuntimeError):
+    """Raised when codebuddy returns a JSON-RPC error response.
+
+    Carries the original `{"code", "message", ...}` dict so callers can
+    branch on the code (e.g. distinguish 429 from protocol errors) without
+    parsing the human-readable string.
+    """
+    def __init__(self, error: dict, method: str = ""):
+        self.error = error or {}
+        self.method = method
+        self.code = self.error.get("code")
+        self.message = self.error.get("message", "")
+        super().__init__(
+            f"ACP error from {method!r}: code={self.code} message={self.message!r}"
+        )
+
+
+class ACPRateLimitError(ACPError):
+    """codebuddy returned 429 (rate limited).
+
+    The prompt may or may not have been processed by the model API before
+    the rate-limit kicked in. Auto-retry is NOT safe — at best it's a no-op,
+    at worst it double-bills. Callers should either switch to a different
+    model (`model="deepseek-v4-flash"` instead of the `hy3` free-tier) or
+    wait for the rate-limit window to reset. The wrapper surfaces the error
+    to the caller and writes a structured log line; it does NOT retry.
+    """
+    def __init__(self, error: dict, method: str = ""):
+        super().__init__(error, method)
+        # Hint to callers: do not auto-retry. If a caller ignores this and
+        # retries, the second attempt is their responsibility.
+        self.retryable = False
 
 
 # ── ACP session (one long-lived codebuddy subprocess) ─────────────
@@ -478,7 +525,17 @@ class ACPSession:
         my_id = self._send(method, params)
         resp = self._wait_id(my_id, timeout)
         if "error" in resp:
-            raise RuntimeError(f"ACP error: {resp['error']}")
+            err = resp["error"] or {}
+            # Detect 429 (rate limit) and raise a structured subclass so
+            # `_run_prompt_in_thread` can branch on it. We match on either
+            # `code == 429` (standard) or the substring "rate limit" in the
+            # message (defensive — codebuddy CLI has been seen using
+            # application-defined codes like -32001 with rate-limit text).
+            code = err.get("code")
+            msg = (err.get("message") or "").lower()
+            if code == 429 or "rate limit" in msg or "rate-limit" in msg:
+                raise ACPRateLimitError(err, method=method)
+            raise ACPError(err, method=method)
         return resp.get("result", {})
 
     def _drain_notifications(self) -> list[dict]:
@@ -655,14 +712,51 @@ class ACPSession:
                         "sessionId": self.session_id,
                         "prompt": [{"type": "text", "text": text}],
                     }, timeout=self.timeout)
+                except ACPRateLimitError as e:
+                    # 429 from codebuddy / model API. The prompt may have
+                    # been processed and billed before the rate-limit kicked
+                    # in — auto-retry would double-bill. Surface structured
+                    # info to the caller; do NOT spin up a fresh session and
+                    # resend. Caller is expected to switch model or wait.
+                    _log_line("prompt_rate_limited", task_id=task_id,
+                              model=model or self.last_model,
+                              code=e.code, msg=e.message)
+                    raise
+                except ACPError:
+                    # Non-429 ACP error (model API 4xx/5xx, invalid params,
+                    # etc.). The prompt was almost certainly delivered and
+                    # the model API processed it. Auto-retry would either
+                    # be a duplicate (double-billed) or hit the same error.
+                    # Surface to the caller; do not retry.
+                    raise
                 except Exception:
-                    # Recovery: the subprocess died mid-call. Spin up a
-                    # fresh ACP session inside the same subprocess.
-                    self._session_new()
-                    r = self.call("session/prompt", {
-                        "sessionId": self.session_id,
-                        "prompt": [{"type": "text", "text": text}],
-                    }, timeout=self.timeout)
+                    # Connection-level / unexpected failure. The retry
+                    # decision is: did the subprocess actually die? If yes,
+                    # the prompt could not have been processed (the proc
+                    # is what holds the connection to the model API), so
+                    # a fresh session on a fresh subprocess is safe. If the
+                    # proc is alive but the call failed (timeout, broken
+                    # pipe recovery that swallowed, etc.), the prompt may
+                    # have been sent — surface as error, do NOT retry.
+                    proc_dead = (self.proc is not None
+                                 and self.proc.poll() is not None)
+                    if proc_dead:
+                        _log_line("prompt_retry_after_subprocess_death",
+                                  task_id=task_id)
+                        # Subprocess died mid-call. Spin up a fresh
+                        # ACP session inside a fresh subprocess.
+                        self._respawn(append_text=self._appended_text,
+                                      model=self.last_model)
+                        r = self.call("session/prompt", {
+                            "sessionId": self.session_id,
+                            "prompt": [{"type": "text", "text": text}],
+                        }, timeout=self.timeout)
+                    else:
+                        # Subprocess alive; the call may have delivered the
+                        # prompt. Don't risk double-billing — surface.
+                        _log_line("prompt_error_no_retry_proc_alive",
+                                  task_id=task_id)
+                        raise
             duration = time.time() - t0
             notifications = self._drain_notifications()
             result = _collect_response_artifacts(

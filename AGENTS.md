@@ -11,7 +11,7 @@ client) that exposes `codebuddy` as 9 MCP tools. mcode loads
 `mcp.json` on session start; the wrapper keeps one
 `codebuddy --acp` subprocess alive for the session.
 
-Version: 0.4.2. Status: stable, in production use.
+Version: 0.4.4. Status: stable, in production use.
 
 ## File layout (what matters)
 
@@ -23,9 +23,9 @@ Version: 0.4.2. Status: stable, in production use.
 | `bin/codebuddy-mcp-server.py` | The stdio MCP wrapper (~1200 lines, one long-lived subprocess) | Adding tools, changing ACP protocol handling, changing log format |
 | `assets/mcode-base-system-prompt.md` | Base system prompt injected into every codebuddy call | Changing mcode's identity/role/boundary for codebuddy |
 | `tests/mcp-poc-test.py` | 5-call cold→warm cache smoke | After changing cache behavior |
-| `tests/mcp-features-test.py` | 7-tool end-to-end (status, list_tasks, list_models, run, submit, get_result, model switch, append respawn, thinking) | After adding/changing tools |
+| `tests/mcp-features-test.py` | 9-tool end-to-end (status, list_tasks, list_models, run, submit, get_result, cancel_task, kill_codebuddy, model switch, append respawn, thinking) | After adding/changing tools |
 | `tests/mcp-long-prompt-test.py` | Long-reply regression for reply concatenation (auto-skips on 429) | After changing reply concatenation |
-| `tests/test_mcp_wrapper_unit.py` | 71 unit tests (no subprocess) | After changing wrapper internals |
+| `tests/test_mcp_wrapper_unit.py` | 91 unit tests (no subprocess) | After changing wrapper internals |
 | `CHANGELOG.md` | Keep-a-Changelog format | Every release |
 
 `state/` and `logs/` are gitignored runtime output. `__pycache__/`

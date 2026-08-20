@@ -4,6 +4,132 @@ All notable changes to this plugin are documented in this file. The format is ba
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.4] - 2026-08-20
+
+### Fixed
+- **Double-billing risk on exception recovery.** The 0.3.x→0.4.3 recovery
+  path in `_run_prompt_in_thread` caught any exception from
+  `self.call("session/prompt", ...)` and re-issued the call against a
+  fresh ACP session. The first call may already have been delivered
+  to codebuddy (and billed) before the exception — a network blip, a
+  broken pipe on the response side, or a JSON-RPC timeout would all
+  trigger a re-send, charging the user twice. New rule:
+  - `ACPRateLimitError` (429) → surface, no retry (prompt may already
+    be billed; switch model or wait).
+  - `ACPError` (any other JSON-RPC error) → surface, no retry (prompt
+    was almost certainly delivered).
+  - Generic `Exception` → only retry if `self.proc.poll() is not None`
+    (subprocess actually died; the prompt could not have been
+    processed). If the proc is alive, surface as error.
+  Net: double-billing window is now closed in the two cases that
+  mattered (429 and any non-subprocess-death failure).
+
+- **`tests/mcp-features-test.py` was asserting 7 tools while the
+  wrapper exposes 9.** Added `cancel_task` and `kill_codebuddy` to
+  the expected tool list. Without this fix the integration test was
+  silently dead — running it would fail loudly; not running it gave
+  a false sense of CI health. Discovered during the 0.4.4 design
+  review. AGENTS.md also updated to match (was "7-tool" and "71 unit
+  tests", now "9-tool" and "91 unit tests").
+
+- **AGENTS.md version drift.** Said "Version: 0.4.2" since 0.4.3
+  shipped; bumped to 0.4.4. Also fixed the "10 top-level fields" /
+  "7-tool" / "71 unit tests" stale strings.
+
+### Added
+- **`ACPError` and `ACPRateLimitError` exception classes**
+  (`bin/codebuddy-mcp-server.py`). Carry the original JSON-RPC
+  `{"code", "message"}` dict, the `method` name, and (for
+  `ACPRateLimitError`) a `retryable=False` hint. Replaces the
+  previous generic `RuntimeError(f"ACP error: {resp['error']}")`
+  string-dump, which forced callers to parse the human-readable
+  message. The recovery path in `_run_prompt_in_thread` now
+  branches on the structured exception class instead of
+  string-matching.
+
+- **Structured 429 detection in `call()`.** Matches on `code == 429`
+  (standard) OR `"rate limit"` / `"rate-limit"` substring in the
+  message (defensive fallback; codebuddy CLI has been seen using
+  application-defined codes like -32001 with rate-limit text).
+  Emits a `prompt_rate_limited` structured log line with the code,
+  message, model, and task_id; the error is propagated to the
+  caller and the in-flight slot is freed.
+
+- **8 new unit tests** (91 total, was 83):
+  - `TestACPErrors` (4): 429-by-code, 429-by-message-text,
+    non-429 error → `ACPError` (not rate-limit subclass), method
+    name carried.
+  - `TestRunPromptRecovery` (4): 429 doesn't retry, non-429
+    `ACPError` doesn't retry, generic exception with proc alive
+    doesn't retry, generic exception with proc dead retries.
+  The old "retry on every exception" behavior was untestable
+  (no test ever covered it) — these tests now pin the new
+  contract.
+
+### Changed
+- **`SKILL.md` restructured** with a decision tree at the top:
+  - Default for any non-trivial call is the **worker subagent**
+    pattern (Pattern A). The worker holds the MCP request;
+    the main agent is unblocked.
+  - Pattern B (main agent calls `mcp__codebuddy__run` directly)
+    is only for short, must-be-inline calls.
+  - Explicit guidance: **do not poll `get_result` at 1s cadence**.
+    Use `run` (which already polls every 2s bounded to 30s) and
+    fall back to `get_result` at ≥2-5s intervals.
+  - Tool table now lists all 9 tools; `kill_codebuddy` was missing.
+  - `get_result` signature corrected: `wait_timeout_s` and
+    `mode` were removed in 0.4.1; the SKILL.md still showed
+    the old `mode="blocking"|"poll"` signature, which would
+    mislead a caller into trying the (now-rejected) blocking
+    mode.
+  - 429 handling section: don't auto-retry, switch model or wait,
+    `deepseek-v4-flash` is the recommended default precisely
+    because the free-tier `hy3` 429s frequently.
+
+- **`mcp.json` now sets an explicit `cwd: "${PLUGIN_ROOT}"`.**
+  The wrapper was previously falling back to `os.getcwd()` at
+  spawn time, which depended on the mcode process's cwd and
+  could vary across clients. The explicit cwd makes the
+  spawn-time working directory stable.
+
+- **`run`'s `wait_timeout_s` default reduced from 3600 to 30.**
+  The `run` tool exists specifically to fit the MCP client's
+  per-request timeout (typically 30-60s); a 1h default defeated
+  the purpose — a caller that passed the default would either
+  hit the client timeout or hang the main agent for an hour.
+  30s matches the documented bounded-wait window. `get_result`
+  and the underlying `ACPSession.timeout` keep their 1h
+  defaults (those are different things: `run` is a single
+  blocking MCP request; `get_result` and `ACPSession.timeout`
+  bound the overall codebuddy call lifetime).
+
+### Removed
+- **Dead `elif` branch in `_collect_response_artifacts`** that
+  tried to extract `codebuddy.ai/responseModelId` from
+  `agent_thought_chunk` / `agent_message_chunk`. The
+  preceding `if`/`elif` already handled those kinds for
+  message/thinking accumulation, so the later branch was
+  unreachable. Replaced with a NOTE comment for the
+  (hypothetical) case where a future codebuddy build
+  starts sending the response model id only on chunks.
+
+### Notes
+- No wrapper-restart required for the wrapper code change
+  (in-process logic). Existing long-lived wrapper
+  subprocesses in flight will still use the old recovery
+  semantics until they restart (the long-lived
+  `codebuddy --acp` subprocess is owned by the wrapper
+  process, so a wrapper restart is the only path to pick
+  up the new behavior).
+- The 429 detection matches on substring `"rate limit"`
+  (case-insensitive) as a defensive fallback. If a future
+  codebuddy build changes the message wording in a way
+  that breaks this, the symptom is: 429 turns into a
+  generic `ACPError` instead of `ACPRateLimitError`, and
+  the wrapper still surfaces it correctly (just without
+  the `retryable=False` hint). Easy to diagnose from
+  the log line.
+
 ## [0.4.3] - 2026-08-20
 
 ### Fixed

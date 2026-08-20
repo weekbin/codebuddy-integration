@@ -1286,5 +1286,226 @@ class TestSessionCloseIdempotent(unittest.TestCase):
         self.assertTrue(sess._closed)
 
 
+class TestACPErrors(unittest.TestCase):
+    """0.4.4: ACPError / ACPRateLimitError model.
+
+    The wrapper surfaces 429 and other JSON-RPC errors as structured
+    exceptions so the recovery path in `_run_prompt_in_thread` can
+    branch on them without parsing the human-readable string.
+    """
+
+    def _make_sess(self):
+        sess = _mod.ACPSession.__new__(_mod.ACPSession)
+        sess.timeout = 3600
+        sess._resp_buf = {}
+        sess._resp_cv = threading.Condition(threading.RLock())
+        sess._id = 0
+        sess._id_lock = threading.Lock()
+        return sess
+
+    def test_429_code_raises_rate_limit_error(self):
+        import unittest.mock as mock
+        sess = self._make_sess()
+        with mock.patch.object(sess, "_send", return_value=1), \
+             mock.patch.object(sess, "_wait_id",
+                               return_value={"jsonrpc": "2.0", "id": 1,
+                                             "error": {"code": 429,
+                                                       "message": "rate limit"}}):
+            with self.assertRaises(_mod.ACPRateLimitError) as cm:
+                sess.call("session/prompt", {})
+        self.assertEqual(cm.exception.code, 429)
+        self.assertEqual(cm.exception.message, "rate limit")
+        self.assertEqual(cm.exception.retryable, False)
+        # ACPRateLimitError is a subclass of ACPError (and RuntimeError)
+        self.assertIsInstance(cm.exception, _mod.ACPError)
+        self.assertIsInstance(cm.exception, RuntimeError)
+
+    def test_rate_limit_text_in_message_raises_rate_limit_error(self):
+        """codebuddy has been seen using non-429 codes with rate-limit text;
+        we match on the message as a defensive fallback."""
+        import unittest.mock as mock
+        sess = self._make_sess()
+        with mock.patch.object(sess, "_send", return_value=1), \
+             mock.patch.object(sess, "_wait_id",
+                               return_value={"jsonrpc": "2.0", "id": 1,
+                                             "error": {"code": -32001,
+                                                       "message": "Rate limit exceeded, please retry later"}}):
+            with self.assertRaises(_mod.ACPRateLimitError):
+                sess.call("session/prompt", {})
+
+    def test_other_error_raises_acp_error(self):
+        import unittest.mock as mock
+        sess = self._make_sess()
+        with mock.patch.object(sess, "_send", return_value=1), \
+             mock.patch.object(sess, "_wait_id",
+                               return_value={"jsonrpc": "2.0", "id": 1,
+                                             "error": {"code": 500,
+                                                       "message": "internal server error"}}):
+            with self.assertRaises(_mod.ACPError) as cm:
+                sess.call("session/prompt", {})
+        # Non-429 errors are ACPError but NOT ACPRateLimitError
+        self.assertNotIsInstance(cm.exception, _mod.ACPRateLimitError)
+        self.assertEqual(cm.exception.code, 500)
+        self.assertEqual(cm.exception.message, "internal server error")
+
+    def test_acp_error_carries_method(self):
+        import unittest.mock as mock
+        sess = self._make_sess()
+        with mock.patch.object(sess, "_send", return_value=1), \
+             mock.patch.object(sess, "_wait_id",
+                               return_value={"jsonrpc": "2.0", "id": 1,
+                                             "error": {"code": 500, "message": "oops"}}):
+            with self.assertRaises(_mod.ACPError) as cm:
+                sess.call("session/whatever", {})
+        self.assertEqual(cm.exception.method, "session/whatever")
+
+
+class TestRunPromptRecovery(unittest.TestCase):
+    """0.4.4: `_run_prompt_in_thread` no longer auto-retries on every
+    exception (that was the double-billing risk: a `session/prompt` that
+    reached codebuddy but errored on the response path would be re-sent).
+    New rules:
+    - ACPRateLimitError: surface, no retry (prompt may already be billed)
+    - ACPError (non-429): surface, no retry (prompt was delivered)
+    - generic Exception + proc dead: retry on a fresh subprocess
+    - generic Exception + proc alive: surface, no retry
+    """
+
+    def _build_sess(self, *, proc_alive=True):
+        sess = _mod.ACPSession.__new__(_mod.ACPSession)
+        sess._inflight = _mod.TaskRecord(
+            task_id="tsk_recovery000", status="running",
+            submitted_at="2026-08-20T10:00:00+00:00",
+        )
+        sess._tasks_done = deque(maxlen=50)
+        sess._task_event = threading.Event()
+        sess._task_lock = threading.Lock()
+        sess._lock = threading.RLock()
+        sess._appended_text = ""
+        sess.session_id = "ses_test_1234"
+        sess.last_model = "deepseek-v4-flash"
+        sess.timeout = 3600
+        sess.call_count = 0
+        sess.last_call_at = 0.0
+        sess.last_cache_ratio = 0.0
+        sess.totals = {"prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0}
+        sess._tasks = []
+        sess.pid = 99999
+        # Fake subprocess (controls alive/dead via poll())
+        import unittest.mock as mock
+        sess.proc = mock.MagicMock()
+        sess.proc.poll.return_value = None if proc_alive else 0
+        return sess
+
+    def _run_sync(self, sess, **kwargs):
+        """Call _run_prompt_in_thread synchronously. Returns the local
+        TaskRecord (which the function snapshots at start); on success or
+        error the record's status/error fields are mutated, even though
+        `sess._inflight` may have been cleared to None."""
+        rec_ref = sess._inflight  # snapshot before
+        sess._run_prompt_in_thread(
+            task_id="tsk_recovery000",
+            text="hello", model=None,
+            append_system_prompt=None,
+            include_thinking=False,
+        )
+        return rec_ref
+
+    def test_429_does_not_retry(self):
+        import unittest.mock as mock
+        sess = self._build_sess(proc_alive=True)
+        # First call raises 429. The recovery path should NOT call again.
+        with mock.patch.object(sess, "call",
+                               side_effect=_mod.ACPRateLimitError(
+                                   {"code": 429, "message": "rate limit"},
+                                   method="session/prompt")), \
+             mock.patch.object(sess, "_respawn") as respawn, \
+             mock.patch.object(_mod, "_save_task", return_value=True), \
+             mock.patch.object(_mod, "_log_line") as log, \
+             mock.patch.object(sess, "_drain_notifications", return_value=[]):
+            rec = self._run_sync(sess)
+        # Must NOT respawn
+        respawn.assert_not_called()
+        # Task marked error
+        self.assertEqual(rec.status, "error")
+        self.assertIn("ACPRateLimitError", rec.error)
+        # Rate-limit log line emitted
+        rate_limited_lines = [c for c in log.call_args_list
+                              if c.args and c.args[0] == "prompt_rate_limited"]
+        self.assertEqual(len(rate_limited_lines), 1)
+        self.assertEqual(rate_limited_lines[0].kwargs["code"], 429)
+        # Inflight cleared
+        self.assertIsNone(sess._inflight)
+
+    def test_acp_error_does_not_retry(self):
+        import unittest.mock as mock
+        sess = self._build_sess(proc_alive=True)
+        with mock.patch.object(sess, "call",
+                               side_effect=_mod.ACPError(
+                                   {"code": 500, "message": "internal"},
+                                   method="session/prompt")), \
+             mock.patch.object(sess, "_respawn") as respawn, \
+             mock.patch.object(_mod, "_save_task", return_value=True), \
+             mock.patch.object(_mod, "_log_line") as log, \
+             mock.patch.object(sess, "_drain_notifications", return_value=[]):
+            rec = self._run_sync(sess)
+        respawn.assert_not_called()
+        self.assertEqual(rec.status, "error")
+        self.assertIn("ACPError", rec.error)
+        # No rate-limit log line
+        rate_limited_lines = [c for c in log.call_args_list
+                              if c.args and c.args[0] == "prompt_rate_limited"]
+        self.assertEqual(rate_limited_lines, [])
+
+    def test_generic_exception_with_proc_alive_does_not_retry(self):
+        """Connection-level error, but the subprocess is still alive. The
+        prompt was sent to the stdin; retrying on the same session would
+        double-bill. Surface as error instead."""
+        import unittest.mock as mock
+        sess = self._build_sess(proc_alive=True)
+        with mock.patch.object(sess, "call",
+                               side_effect=ConnectionError("pipe broken")), \
+             mock.patch.object(sess, "_respawn") as respawn, \
+             mock.patch.object(_mod, "_save_task", return_value=True), \
+             mock.patch.object(_mod, "_log_line") as log, \
+             mock.patch.object(sess, "_drain_notifications", return_value=[]):
+            rec = self._run_sync(sess)
+        respawn.assert_not_called()
+        self.assertEqual(rec.status, "error")
+        self.assertIn("ConnectionError", rec.error)
+        # Log line records the no-retry decision
+        no_retry_lines = [c for c in log.call_args_list
+                          if c.args and c.args[0] == "prompt_error_no_retry_proc_alive"]
+        self.assertEqual(len(no_retry_lines), 1)
+
+    def test_generic_exception_with_proc_dead_triggers_retry(self):
+        """If the subprocess actually died, the prompt could not have been
+        processed (the proc holds the connection to the model API). A
+        fresh subprocess + fresh session is safe."""
+        import unittest.mock as mock
+        sess = self._build_sess(proc_alive=False)  # proc.poll() == 0
+        # First call raises (proc dies after, say, ConnectionError). Second
+        # call (after respawn) returns a normal result.
+        good_result = {"stopReason": "end_turn", "text": "ok",
+                       "usage": {"prompt_tokens": 10, "completion_tokens": 5,
+                                 "prompt_tokens_details": {"cached_tokens": 8}}}
+        with mock.patch.object(sess, "call",
+                               side_effect=[ConnectionError("pipe broken"),
+                                            good_result]), \
+             mock.patch.object(sess, "_respawn") as respawn, \
+             mock.patch.object(_mod, "_save_task", return_value=True), \
+             mock.patch.object(_mod, "_log_line") as log, \
+             mock.patch.object(sess, "_drain_notifications", return_value=[]):
+            rec = self._run_sync(sess)
+        # Respawn WAS called
+        respawn.assert_called_once()
+        # Retry succeeded → task is done, not error
+        self.assertEqual(rec.status, "done")
+        # Log line records the retry decision
+        retry_lines = [c for c in log.call_args_list
+                       if c.args and c.args[0] == "prompt_retry_after_subprocess_death"]
+        self.assertEqual(len(retry_lines), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
