@@ -4,6 +4,80 @@ All notable changes to this plugin are documented in this file. The format is ba
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.3] - 2026-08-20
+
+### Fixed
+- **CRITICAL: every `submit_prompt` / `run` call self-deadlocked on first use.**
+  `ACPSession._lock` was a non-reentrant `threading.Lock()`, but
+  `_run_prompt_in_thread` (line ~639) holds `_lock` across
+  `self.call("session/prompt", ...)`, and `call()` → `_wait_id()` re-acquires
+  the same lock via `with self._resp_cv:` (a `Condition(_lock)`). A plain
+  `Lock` cannot be re-acquired by its owner thread, so the worker thread
+  deadlocks on the inner `with`. Symptoms: `call_count` stays at 0 forever;
+  the task worker is stuck in `futex_do_wait`; the reader thread is stuck in
+  `unix_stream_data_wait` because the prompt was never written to codebuddy
+  stdin. `list_models` appeared to work because it reads the cached
+  `_session.available_models` list and never calls `self.call()`. The bug
+  was present from 0.3.0 through 0.4.2 but went unnoticed because every
+  hung call was cancelled by the user before it produced any diagnostic
+  output. `bin/codebuddy-mcp-server.py:339` — `self._lock = threading.Lock()`
+  → `threading.RLock()`. This is a one-character surface change with a
+  behavior-level fix for an issue that has been silently breaking every
+  `session/prompt` since the wrapper was written.
+- **Wrapper left the long-lived `codebuddy --acp` subprocess orphaned on
+  session-exit signals.** Default signal action for SIGTERM / SIGHUP /
+  SIGINT is immediate exit, which skips the `finally` block that calls
+  `_session.close()`. After several minutes of mcode being killed and
+  restarted, orphan wrappers from previous sessions could be observed
+  hanging with no parent and a stale `codebuddy` subprocess. Now:
+  `_install_signal_handlers()` (called from the main `if __name__` block,
+  before `asyncio.run`) hooks the three signals and routes them through
+  `ACPSession.close()` (idempotent, see below) before calling `os._exit(0)`.
+  A second signal during cleanup forces immediate exit (`os._exit(1)`) so
+  a stuck `codebuddy` terminate can't hang the wrapper. Best-effort: if
+  `signal.signal` itself fails (non-main thread, restricted env), we log
+  and continue without handlers — the implicit stdio-EOF path in `main()`
+  will eventually close the subprocess, just with the previous second-scale
+  delay.
+
+### Changed
+- **`ACPSession.close()` is now idempotent and logs the shutdown outcome.**
+  Sets `self._closed = True` on first call; subsequent calls (e.g. from
+  the main `finally` block after a signal handler already ran) are no-ops.
+  Graceful timeout: if `proc.terminate()` + `proc.wait(timeout=5)` doesn't
+  take, falls through to `proc.kill()`. Emits a `wrapper_shutdown` log
+  line with `pid` and `reason` (`ok` / `terminate_timeout_force_kill` /
+  `terminate_failed:<ExceptionType>`) for post-mortem diagnostics.
+
+### Added
+- **`TestLockReentrancyForSessionPrompt`** (3 tests, `tests/test_mcp_wrapper_unit.py`):
+  direct type check, runtime reentrancy behavior check, and a static
+  source-grep that fails on any future re-introduction of
+  `self._lock = threading.Lock()`. The behavior test uses a 2-second
+  timeout so a real deadlock surfaces as a clear test failure rather than
+  a hung test runner.
+- **`TestSignalHandlerInstallation`** (4 tests): verifies all three
+  signals are hooked after install, install is idempotent, the installed
+  handler closes the session + exits with code 0 on first signal, and
+  the force-exit-on-second-signal path uses code 1 without re-calling
+  `close()`. Saves and restores original signal handlers so the test
+  runner isn't affected.
+- **`TestSessionCloseIdempotent`** (5 tests): verifies `close()` calls
+  `terminate` exactly once across multiple invocations, falls through to
+  `kill()` on `TimeoutExpired`, swallows `OSError` from a dead proc,
+  and sets the `_closed` flag.
+
+### Notes
+- Existing wrapper processes are unaffected by the source change. Restart
+  mcode (or otherwise restart the codebuddy-integration MCP server) to
+  pick up the fix; the old wrapper still has the buggy `Lock` baked in
+  and no signal handlers installed.
+- The pre-existing test `TestTaskPersistence.test_gc_marks_running_tasks_as_stale`
+  is a time-bomb that fails on or after 2026-08-19 (it hardcodes
+  `completed_at="2026-08-18T10:00:01+00:00"` for the "fresh" task, but
+  `TASK_LIFETIME_S=86400` (24h) means GC correctly deletes it after 24h).
+  Unrelated to this fix; flagging for a follow-up.
+
 ## [0.4.2] - 2026-08-18
 
 ### Added

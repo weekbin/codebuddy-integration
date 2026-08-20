@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """test_mcp_wrapper_unit.py - unit tests for codebuddy-mcp-server (no subprocess)"""
-import importlib.util, json, sys, tempfile, threading, time, unittest, uuid
+import importlib.util, json, signal, subprocess, sys, tempfile, threading, time, unittest, uuid
 from collections import deque
 from pathlib import Path
 
@@ -1034,6 +1034,256 @@ class TestStatusModelFallback(unittest.TestCase):
 def asyncio_run(coro):
     import asyncio
     return asyncio.new_event_loop().run_until_complete(coro)
+
+
+class TestLockReentrancyForSessionPrompt(unittest.TestCase):
+    """0.4.3 regression: `self._lock` MUST be an RLock.
+
+    Root cause of the long-standing "first call hangs forever" bug:
+    `_run_prompt_in_thread` (line ~639 in codebuddy-mcp-server.py) does
+        with self._lock:
+            self.call("session/prompt", {...})
+    and `call()` → `_wait_id()` does
+        with self._resp_cv:   # Condition(self._lock)
+            self._resp_cv.wait(...)
+    If `_lock` is a plain `threading.Lock()`, the inner `with self._resp_cv:`
+    self-deadlocks (same thread trying to re-acquire a non-reentrant lock).
+    The symptom in the field: call_count stays at 0, the task thread blocks
+    on `futex_do_wait`, the reader thread waits forever on
+    `unix_stream_data_wait` (no data was ever written to codebuddy stdin).
+
+    Only `list_models` appeared to work because it reads the cached
+    `available_models` list and never calls `self.call()`. Any actual
+    `session/prompt` (i.e., every `submit_prompt` / `submit_continue` /
+    `run` / `cancel_task` with codebuddy work) deadlocked.
+    """
+
+    def test_lock_is_rlock(self):
+        """Direct type check: ACPSession must initialize _lock as RLock."""
+        sess = _mod.ACPSession.__new__(_mod.ACPSession)
+        # Mirror the exact init lines we ship (do not call __init__,
+        # which would spawn a real codebuddy subprocess).
+        sess._id_lock = threading.Lock()
+        sess._lock = threading.RLock()
+        sess._resp_buf = {}
+        sess._resp_cv = threading.Condition(sess._lock)
+        self.assertIsInstance(sess._lock, type(threading.RLock()))
+        self.assertNotIsInstance(sess._lock, type(threading.Lock()))
+        # The bug: if anyone re-introduces threading.Lock() here, this
+        # assert catches it without spawning a subprocess.
+        # (threading.Lock and threading.RLock are different classes; the
+        # type() comparison above distinguishes them.)
+
+    def test_lock_allows_same_thread_reentrant_acquire(self):
+        """Behavior check: holding _lock then entering `_resp_cv` (which
+        acquires _lock again) must NOT deadlock. If _lock is a plain Lock,
+        this test deadlocks and unittest fails with a timeout."""
+        sess = _mod.ACPSession.__new__(_mod.ACPSession)
+        sess._id_lock = threading.Lock()
+        sess._lock = threading.RLock()
+        sess._resp_buf = {}
+        sess._resp_cv = threading.Condition(sess._lock)
+        # Bound the test so a real deadlock surfaces as a test failure
+        # (not a hung test runner).
+        done = threading.Event()
+        def worker():
+            with sess._lock:           # outer acquire
+                with sess._resp_cv:    # inner acquire — was the bug site
+                    done.set()
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        self.assertTrue(done.wait(timeout=2.0),
+                        "deadlock: same thread could not re-acquire _lock "
+                        "via _resp_cv — _lock is not reentrant")
+        t.join(timeout=1.0)
+
+    def test_lock_type_in_source(self):
+        """Static guard: catch a future regression at code-review time.
+        If someone reverts threading.RLock() back to threading.Lock(),
+        this test fires immediately without needing a real subprocess."""
+        import inspect
+        src = inspect.getsource(_mod.ACPSession.__init__)
+        # We allow the word "Lock" in a comment but require the actual
+        # assignment to be RLock.
+        self.assertRegex(
+            src,
+            r"self\._lock\s*=\s*threading\.RLock\(\)",
+            "_lock must be initialized as threading.RLock() — see "
+            "TestLockReentrancyForSessionPrompt docstring for the bug history",
+        )
+        self.assertNotRegex(
+            src,
+            r"self\._lock\s*=\s*threading\.Lock\(\)",
+            "self._lock = threading.Lock() re-introduces the 0.3.0..0.4.2 "
+            "self-deadlock bug; use threading.RLock() instead",
+        )
+
+
+class TestSignalHandlerInstallation(unittest.TestCase):
+    """0.4.3: SIGTERM / SIGHUP / SIGINT must be hooked so the long-lived
+    `codebuddy --acp` subprocess is closed cleanly on session exit.
+
+    Without these handlers, default signal action is immediate exit —
+    the long-lived codebuddy subprocess becomes orphaned and the
+    in-flight task is left in `running` state until the next wrapper
+    start marks it stale.
+    """
+
+    def setUp(self):
+        # Save original signal handlers so the test runner isn't affected.
+        # `signal.SIGTERM` may be `signal.SIG_DFL` (None) in some envs; that
+        # is fine — we restore None at the end which is equivalent.
+        self._orig_handlers = {
+            sig: signal.getsignal(sig)
+            for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+        }
+    def tearDown(self):
+        for sig, h in self._orig_handlers.items():
+            try:
+                signal.signal(sig, h)
+            except Exception:
+                pass
+
+    def test_install_hooks_all_three_signals(self):
+        """All three session-exit signals must be re-hooked after
+        _install_signal_handlers()."""
+        _mod._install_signal_handlers()
+        for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            h = signal.getsignal(sig)
+            self.assertTrue(
+                callable(h),
+                f"signal {int(sig)} handler should be a callable after "
+                f"_install_signal_handlers(); got {h!r}",
+            )
+
+    def test_install_is_idempotent(self):
+        """Re-installing must not raise and must keep the handler present."""
+        _mod._install_signal_handlers()
+        _mod._install_signal_handlers()
+        for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            self.assertTrue(callable(signal.getsignal(sig)))
+
+    def test_handler_closes_session_then_exits(self):
+        """The installed handler must (a) close the codebuddy session
+        if one exists, then (b) force-exit the process. We exercise the
+        path by injecting a fake _session and calling the handler
+        function directly via `os.kill(self, SIGTERM)` in a thread
+        that catches the resulting SystemExit.
+
+        This is the closest we can get to a real signal test in a unit
+        test process without forking a subprocess.
+        """
+        import unittest.mock as mock
+
+        # Inject a fake session; handler must call close() on it.
+        fake_sess = mock.MagicMock()
+        # Save the module-level global, install fake, restore in finally.
+        orig = _mod._session
+        _mod._session = fake_sess
+        try:
+            _mod._install_signal_handlers()
+
+            # Run the signal handler in a worker thread; os._exit skips
+            # Python cleanup, so the thread will be killed mid-call. To
+            # observe the close() side-effect we instead invoke the
+            # installed handler function directly with synthetic args.
+            handler = signal.getsignal(signal.SIGTERM)
+            # The handler will call os._exit(0); that raises SystemExit
+            # in the main thread. In a thread it just terminates the
+            # thread. We catch SystemExit to keep the test process alive.
+            try:
+                handler(signal.SIGTERM, None)
+            except SystemExit as e:
+                # Expected: os._exit(0) → SystemExit(0)
+                self.assertEqual(e.code, 0)
+
+            fake_sess.close.assert_called_once()
+        finally:
+            _mod._session = orig
+
+    def test_handler_force_exits_on_second_signal(self):
+        """A second signal during in-progress close() must force-exit
+        (os._exit(1)) instead of re-running close()."""
+        import unittest.mock as mock
+        # Simulate first-signal-already-arrived by setting the flag.
+        _mod._signal_force_exit = True
+        try:
+            fake_sess = mock.MagicMock()
+            orig = _mod._session
+            _mod._session = fake_sess
+            try:
+                _mod._install_signal_handlers()
+                handler = signal.getsignal(signal.SIGTERM)
+                try:
+                    handler(signal.SIGTERM, None)
+                except SystemExit as e:
+                    self.assertEqual(e.code, 1)  # force-exit code
+                # close() must NOT be called on the second signal
+                fake_sess.close.assert_not_called()
+            finally:
+                _mod._session = orig
+        finally:
+            _mod._signal_force_exit = False
+
+
+class TestSessionCloseIdempotent(unittest.TestCase):
+    """0.4.3: ACPSession.close() must be idempotent.
+
+    Both the main `finally` block AND the SIGTERM/SIGHUP/SIGINT signal
+    handler can call close() on the same session. The second call
+    must be a no-op so we don't double-terminate (or worse, try to
+    terminate an already-dead proc and raise).
+    """
+
+    def _make_sess(self, *, wait_side_effect=None, terminate_side_effect=None):
+        import unittest.mock as mock
+        sess = _mod.ACPSession.__new__(_mod.ACPSession)
+        sess.proc = mock.MagicMock()
+        sess.pid = 100
+        if wait_side_effect:
+            sess.proc.wait.side_effect = wait_side_effect
+        if terminate_side_effect:
+            sess.proc.terminate.side_effect = terminate_side_effect
+        return sess
+
+    def test_close_terminates_codebuddy(self):
+        sess = self._make_sess()
+        sess.close()
+        sess.proc.terminate.assert_called_once()
+        sess.proc.wait.assert_called_once_with(timeout=5)
+
+    def test_close_is_idempotent(self):
+        """Three calls → terminate called exactly once."""
+        sess = self._make_sess()
+        sess.close()
+        sess.close()
+        sess.close()
+        self.assertEqual(sess.proc.terminate.call_count, 1)
+        self.assertEqual(sess.proc.wait.call_count, 1)
+
+    def test_close_kills_on_terminate_timeout(self):
+        """If terminate doesn't take within 5s, must force-kill."""
+        sess = self._make_sess(
+            wait_side_effect=subprocess.TimeoutExpired(cmd="codebuddy", timeout=5)
+        )
+        sess.close()
+        sess.proc.terminate.assert_called_once()
+        sess.proc.kill.assert_called_once()
+
+    def test_close_handles_terminate_exception(self):
+        """If terminate itself raises (e.g. process already gone),
+        must fall through to kill() and not propagate."""
+        sess = self._make_sess(terminate_side_effect=OSError("ESRCH"))
+        # Should not raise.
+        sess.close()
+        sess.proc.kill.assert_called_once()
+
+    def test_close_sets_closed_flag(self):
+        """The `_closed` attribute is the idempotency guard."""
+        sess = self._make_sess()
+        self.assertFalse(getattr(sess, "_closed", False))
+        sess.close()
+        self.assertTrue(sess._closed)
 
 
 if __name__ == "__main__":

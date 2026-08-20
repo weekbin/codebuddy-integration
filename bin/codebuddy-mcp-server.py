@@ -19,6 +19,7 @@ import dataclasses
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -336,7 +337,14 @@ class ACPSession:
         self.timeout = timeout
         self._id = 0
         self._id_lock = threading.Lock()
-        self._lock = threading.Lock()
+        # _lock MUST be reentrant: _run_prompt_in_thread (line ~639) holds it
+        # across `self.call("session/prompt", ...)`, and call() → _wait_id()
+        # re-acquires it via `with self._resp_cv:`. A plain Lock self-deadlocks
+        # on every prompt call — symptom is a worker thread stuck in
+        # futex_do_wait with call_count never incrementing. Bug present from
+        # 0.3.0..0.4.2; only list_models (which reads cached session catalog
+        # and never calls call()) appeared to work. Fixed in 0.4.3.
+        self._lock = threading.RLock()
         self._resp_buf: dict[int, dict] = {}
         self._resp_cv = threading.Condition(self._lock)
         self._notifications: list[dict] = []
@@ -978,10 +986,36 @@ class ACPSession:
         return items
 
     def close(self):
-        try: self.proc.terminate(); self.proc.wait(timeout=5)
+        """Cleanly shut down the codebuddy subprocess. Idempotent: safe to
+        call from both a signal handler (e.g. SIGTERM) and the main
+        `finally` block. The first call terminates + waits; subsequent
+        calls are no-ops. Logs the outcome for diagnostics.
+        """
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        reason = "ok"
+        try:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                # Graceful terminate didn't take. Force kill.
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+                reason = "terminate_timeout_force_kill"
+        except Exception as e:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+            reason = f"terminate_failed:{type(e).__name__}"
+        try:
+            _log_line("wrapper_shutdown", pid=self.pid, reason=reason)
         except Exception:
-            try: self.proc.kill()
-            except Exception: pass
+            pass
 
 
 _session: Optional[ACPSession] = None
@@ -1384,6 +1418,54 @@ async def main():
         await app.run(read_stream, write_stream, app.create_initialization_options())
 
 
+# Module-level flag used by _install_signal_handlers: a second signal
+# during in-progress cleanup forces immediate os._exit so a stuck
+# codebuddy terminate can't hang the wrapper indefinitely.
+_signal_force_exit = False
+
+
+def _install_signal_handlers():
+    """Install SIGTERM / SIGHUP / SIGINT handlers that cleanly close the
+    codebuddy subprocess before exiting. Without this, default signal
+    behavior (immediate exit) leaves the long-lived `codebuddy --acp`
+    subprocess orphaned whenever mcode shuts down, the controlling
+    terminal closes, or the wrapper is `kill`-ed (graceful).
+
+    Best-effort: `signal.signal` can fail in non-main threads or
+    restricted environments. We log and continue without handlers in
+    that case — the implicit stdio-EOF path in `main()` will eventually
+    close the subprocess, just with a small delay.
+
+    Idempotent: a second signal during close() forces immediate exit
+    (`os._exit(1)`) so a stuck `codebuddy` terminate can't hang the
+    wrapper forever.
+    """
+    def _handler(signum, _frame):
+        global _signal_force_exit
+        if _signal_force_exit:
+            os._exit(1)
+        _signal_force_exit = True
+        try:
+            sess = _session
+            if sess is not None:
+                sess.close()
+        except Exception:
+            pass
+        # Skip Python atexit / finally cleanup; we've already closed
+        # the subprocess and the idempotent guard prevents double-close.
+        os._exit(0)
+
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        try:
+            signal.signal(sig, _handler)
+        except (ValueError, OSError) as e:
+            # Non-main thread or restricted env; log and continue.
+            try:
+                _log_line("signal_handler_install_failed", sig=int(sig), err=str(e))
+            except Exception:
+                pass
+
+
 if __name__ == "__main__":
     # 0.4.0: at startup, mark any "running" task files as "stale" — they
     # were left in-flight by a previous wrapper process that died. GC also
@@ -1393,6 +1475,11 @@ if __name__ == "__main__":
         _gc_orphan_tasks()
     except Exception:
         pass
+    # 0.4.3: install SIGTERM/SIGHUP/SIGINT handlers BEFORE asyncio.run so
+    # the long-lived `codebuddy --acp` subprocess is closed cleanly on
+    # session exit. Without this, default signal action leaves the
+    # subprocess orphaned. Idempotent: a second signal forces exit.
+    _install_signal_handlers()
     try: asyncio.run(main())
     except KeyboardInterrupt: pass
     finally:

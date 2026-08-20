@@ -5,7 +5,7 @@ license: MIT
 compatibility: "Requires MiniMax Code with Agent Plugins 1.0.0+ support, the `codebuddy` CLI on $PATH (or `CODEBUDDY_BIN` env var), Python 3.10+ with the `mcp>=2.0.0,<3` package installed into the **same** `python3` the wrapper resolves at runtime (its shebang `#!/usr/bin/env python3`); otherwise startup fails with `ModuleNotFoundError: No module named 'mcp'` and the plugin loads zero tools."
 metadata:
   author: weekbin
-  version: "0.4.2"
+  version: "0.4.3"
 ---
 
 # codebuddy-integration
